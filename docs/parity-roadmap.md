@@ -119,14 +119,32 @@ ships CUDA kernels for Linux/WSL2).
   UCI `WeightsFile`) so a stronger evaluator can be dropped in without code
   changes. [bin/net_info.dart](../bin/net_info.dart) prints a net's architecture
   + noise-free startpos priors to check compatibility.
-- **Net-compatibility finding** ⚠️ dart_pytorch 0.1.3's `Lc0Reader` only reliably
-  parses 744706-style SE-ResNet nets (conv policy + WDL). Tested larger nets:
-  `t1-256x10-distilled` / `t1-256x10-rl-base` are **rejected** ("missing
-  classical fields"); the 2019 `256x20-t40` **loads but is mis-parsed** (scrambled
-  policy, e.g. h2h3/a2a3 as top priors); attention-body nets (BT*, `*x…h`) are
-  unsupported. So bigger-net strength scaling is currently blocked by the reader,
-  not by this project's evaluator/search (same code gives correct priors on
-  744706). A future dart_pytorch with broader net support unlocks this lever.
+- **Net-compatibility finding** dart_pytorch 0.1.3's classical `Lc0Reader` only
+  parses 744706-style SE-ResNet nets (conv policy + WDL). Modern nets
+  (`t1-256x10-*`, BT*, `*x…h`) use an **attention body** (transformer + smolgen +
+  attention policy) that the classical reader can't handle — see Stage 6.
+
+### Stage 6 — Attention-body (transformer) net support  ✅ done & validated
+A pure-Dart port of lc0's attention-body forward, added to the local
+`dart_pytorch` (`lib/core/nn/lc0_attn.dart`), so modern nets run as evaluators.
+- **Architecture:** input embedding (112 planes + `kPosEncoding` → 176 →
+  embDim, MISH, `ma_gating`) → N encoder layers (MHA with **smolgen**, FFN, two
+  `LayerNorm(α·skip)`) → attention policy head (wq/wk → 64×64 + promotions →
+  `kAttnPolicyMap` → 1858) + WDL value + moves-left heads. Transcribed from lc0's
+  BLAS backend (`network_blas.cc`, `encoder.cc`) + the ONNX graph.
+- **Key gotcha:** per-net activations — this net uses **Swish** for smolgen and
+  **ReLU²** for the FFN (not the default MISH); the embedding/heads use MISH.
+- **Validation:** against lc0 v0.32.1 on `t1-256x10-distilled` at the start
+  position — policy ordering matches (d2d4 > g1f3 > e2e4 > c2c4 ≈ g2g3 …), value
+  WDL `0.228/0.583/0.189` vs lc0 `0.226/0.584/0.190`, and MLH `185.1` exact.
+- **Wiring:** [lib/lc0_evaluator.dart](../lib/lc0_evaluator.dart) dispatches
+  classical (conv policy) vs attention (1858 policy) by format
+  (`Lc0AttnWeights.isAttentionNet`); `--net <attention net>` works in
+  play_search / solve_epd / UCI. Build milestones M1–M5; debugging used
+  [bin/onnx_dump.dart](../bin/onnx_dump.dart) + official lc0.exe ground truth.
+- **Perf:** ~375 ms/forward pure-Dart CPU (vs 57 ms for the conv net); the
+  isolate pool parallelises it (~67 ms/sim at 8 workers). Optimising via the
+  Tensor matmul path is future work.
 
 ## Notes / constraints
 - CPU-only here, so Stage 2 nets stay modest; GPU (WSL) unlocks Stage 5.

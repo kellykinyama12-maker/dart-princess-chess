@@ -33,3 +33,9 @@ int? convIndexForUci(String absoluteUci, int sideToMove) {
   final conv = _idxToConv[idx];
   return conv >= 0 ? conv : null;
 }
+
+/// Classical 1858 move index for an absolute-board UCI move given the side to
+/// move, or null if the move isn't in the 1858 table. Used for attention-policy
+/// nets, whose head already outputs the 1858 classical ordering.
+int? moveIndexForUci(String absoluteUci, int sideToMove) =>
+    _uciToIdx[toAbsoluteUci(absoluteUci, sideToMove)];
