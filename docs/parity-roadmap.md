@@ -110,6 +110,12 @@ Addresses **G6**. Bigger net + more data; optional SE / attention refinements;
 evaluate against puzzles and known positions; optional GPU via WSL (the package
 ships CUDA kernels for Linux/WSL2).
 
+- **Tactics harness** ✅ [bin/solve_epd.dart](../bin/solve_epd.dart) runs EPD
+  suites (`bm`/`am`, SAN-matched to the engine's move) and reports a solve rate;
+  ships a small WAC subset in [test/tactics.epd](../test/tactics.epd).
+  `dart run bin/solve_epd.dart --nodes 2000 --workers 8`. Use it to track
+  strength as nodes/net scale.
+
 ## Notes / constraints
 - CPU-only here, so Stage 2 nets stay modest; GPU (WSL) unlocks Stage 5.
 - test80 data is `input_format == 1` (classical 112-plane) — confirmed by the
