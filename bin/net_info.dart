@@ -21,6 +21,9 @@ void main(List<String> args) {
   stdout.writeln('filters=${w.filters} blocks=${w.numBlocks} '
       'policyPlanes=${w.policyOutputPlanes} valueFC=${w.valueFCUnits} '
       'wdl=${w.wdl}');
+  final seBlocks = w.residual.where((r) => r.se != null).length;
+  stdout.writeln('residuals=${w.residual.length} seBlocks=$seBlocks '
+      'movesLeft=${w.movesLeftFilters != null}');
 
   final evaluator = Lc0Evaluator.load(path);
   final board = ch.Chess.fromFEN(_startFen);
