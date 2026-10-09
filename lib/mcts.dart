@@ -52,6 +52,7 @@ class Mcts {
   final math.Random _rng;
 
   _Node? _root; // persisted across searches to enable tree reuse
+  bool _stopFlag = false; // set by stop() to end a search budget early
 
   Mcts(
     Lc0Evaluator this.eval, {
@@ -101,33 +102,76 @@ class Mcts {
   /// Runs simulations until the root reaches [sims] total visits (reused-tree
   /// visits count toward that budget), then returns root moves ranked by visit
   /// count. Reuses the persistent subtree when it matches [rootFen].
-  List<MoveStat> search(String rootFen, int sims) {
+  List<MoveStat> search(String rootFen, int sims) =>
+      searchBudget(rootFen, nodes: sims);
+
+  /// Asks a running [searchBudget]/[searchBudgetAsync] to return early.
+  void stop() => _stopFlag = true;
+
+  /// Searches until [nodes] total root visits or the [time] deadline is hit
+  /// (whichever comes first), or until [stop] is called.
+  List<MoveStat> searchBudget(String rootFen, {int? nodes, Duration? time}) {
+    _stopFlag = false;
+    final root = _prepareRoot(rootFen);
+    final target = nodes ?? (1 << 30);
+    final deadline = time == null ? null : DateTime.now().add(time);
+    if (!root.terminal) {
+      while (root.visits < target && !_stopFlag && !_passed(deadline)) {
+        if (batchSize <= 1) {
+          _simulate(root);
+        } else {
+          _runBatch(root, math.min(batchSize, target - root.visits));
+        }
+      }
+    }
+    return _rootStats(root);
+  }
+
+  _Node _prepareRoot(String rootFen) {
     final reuse = _root != null && _root!.fen == rootFen;
     final root = reuse ? _root! : _Node(rootFen, _stm(rootFen), 1.0);
     _root = root;
-
     // Expand the root first so exploration noise can be seeded on its children.
     if (root.children == null) {
       _expand(root);
     }
     _applyRootNoise(root);
+    return root;
+  }
 
-    if (!root.terminal) {
-      while (root.visits < sims) {
-        if (batchSize <= 1) {
-          _simulate(root);
-        } else {
-          _runBatch(root, math.min(batchSize, sims - root.visits));
-        }
-      }
-    }
+  bool _passed(DateTime? deadline) =>
+      deadline != null && !DateTime.now().isBefore(deadline);
 
+  List<MoveStat> _rootStats(_Node root) {
     final stats = <MoveStat>[];
     root.children?.forEach((uci, child) {
       stats.add(MoveStat(uci, child.visits, child.q, child.prior));
     });
     stats.sort((a, b) => b.visits.compareTo(a.visits));
     return stats;
+  }
+
+  /// Principal variation from the current root, following the most-visited
+  /// child at each ply, as absolute UCI moves.
+  List<String> principalVariation({int maxLen = 16}) {
+    final pv = <String>[];
+    var node = _root;
+    while (node != null && node.children != null && pv.length < maxLen) {
+      String? bestUci;
+      _Node? bestChild;
+      var bestVisits = -1;
+      node.children!.forEach((uci, child) {
+        if (child.visits > bestVisits) {
+          bestVisits = child.visits;
+          bestUci = uci;
+          bestChild = child;
+        }
+      });
+      if (bestUci == null || bestVisits <= 0) break;
+      pv.add(bestUci!);
+      node = bestChild;
+    }
+    return pv;
   }
 
   /// Picks a move from search [stats]. [temperature] 0 is greedy (most visits);
@@ -153,7 +197,13 @@ class Mcts {
   /// Pool-backed search: each virtual-loss leaf is expanded (move-gen + eval)
   /// in parallel on a worker isolate. Requires [Mcts.pooled]. Same total-visit
   /// budget and tree-reuse semantics as [search].
-  Future<List<MoveStat>> searchAsync(String rootFen, int sims) async {
+  Future<List<MoveStat>> searchAsync(String rootFen, int sims) =>
+      searchBudgetAsync(rootFen, nodes: sims);
+
+  /// Node/time-budgeted pool-backed search (see [searchBudget]).
+  Future<List<MoveStat>> searchBudgetAsync(String rootFen,
+      {int? nodes, Duration? time}) async {
+    _stopFlag = false;
     final reuse = _root != null && _root!.fen == rootFen;
     final root = reuse ? _root! : _Node(rootFen, _stm(rootFen), 1.0);
     _root = root;
@@ -163,17 +213,14 @@ class Mcts {
     }
     _applyRootNoise(root);
 
+    final target = nodes ?? (1 << 30);
+    final deadline = time == null ? null : DateTime.now().add(time);
     if (!root.terminal) {
-      while (root.visits < sims) {
-        await _runBatchAsync(root, math.min(batchSize, sims - root.visits));
+      while (root.visits < target && !_stopFlag && !_passed(deadline)) {
+        await _runBatchAsync(root, math.min(batchSize, target - root.visits));
       }
     }
-    final stats = <MoveStat>[];
-    root.children?.forEach((uci, child) {
-      stats.add(MoveStat(uci, child.visits, child.q, child.prior));
-    });
-    stats.sort((a, b) => b.visits.compareTo(a.visits));
-    return stats;
+    return _rootStats(root);
   }
 
   /// Collects [count] leaves (virtual loss), expands the unique unexpanded ones

@@ -89,6 +89,22 @@ from the (lc0) policy head and leaf values from the value head. Remaining polish
 - **Acceptance:** with search the engine selects sound moves and is strictly
   stronger than the raw argmax policy as sims increase.
 
+### Stage 4c — Parallel search (isolate eval pool)  ✅ done
+A pool of worker isolates ([lib/eval_pool.dart](../lib/eval_pool.dart)) each hold
+their own `Lc0Net`; virtual-loss leaf batches are expanded (move-gen + eval) in
+parallel off the main isolate. `--workers N` in play_search / `Threads` in UCI.
+On a 16-core CPU: ~52 ms/sim (1 thread) → ~11 ms/sim (12 threads).
+
+### Stage 4d — UCI interface  ✅ done
+[bin/uci.dart](../bin/uci.dart) speaks UCI so the engine plays in any GUI or
+against other engines: `position`, `go movetime|nodes|infinite|wtime/btime`,
+`stop`, `setoption Threads|Nodes|Cpuct`, with `info … score cp … pv …` and
+`bestmove`. Node/time budgets + `stop` + principal variation live in
+[lib/mcts.dart](../lib/mcts.dart) (`searchBudget`/`searchBudgetAsync`). Tree
+reuse carries across `position` commands that extend the previous line.
+- **Acceptance (met):** a full UCI handshake drives legal play; e.g. after
+  `e2e4 e7e5`, `go nodes 150` → `bestmove b1c3` with a multi-ply PV.
+
 ### Stage 5 — Scale & quality  ⬜
 Addresses **G6**. Bigger net + more data; optional SE / attention refinements;
 evaluate against puzzles and known positions; optional GPU via WSL (the package
