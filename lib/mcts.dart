@@ -3,6 +3,7 @@ import 'dart:math' as math;
 
 import 'package:chess/chess.dart' as ch;
 
+import 'board_expand.dart';
 import 'eval_pool.dart';
 import 'lc0_evaluator.dart';
 
@@ -149,20 +150,16 @@ class Mcts {
     return stats.last;
   }
 
-  /// Pool-backed search: evaluates each virtual-loss leaf batch in parallel on
-  /// the isolate pool. Requires [Mcts.pooled]. Same total-visit budget and
-  /// tree-reuse semantics as [search].
+  /// Pool-backed search: each virtual-loss leaf is expanded (move-gen + eval)
+  /// in parallel on a worker isolate. Requires [Mcts.pooled]. Same total-visit
+  /// budget and tree-reuse semantics as [search].
   Future<List<MoveStat>> searchAsync(String rootFen, int sims) async {
     final reuse = _root != null && _root!.fen == rootFen;
     final root = reuse ? _root! : _Node(rootFen, _stm(rootFen), 1.0);
     _root = root;
 
     if (root.children == null) {
-      final prep = _prepareExpand(root);
-      if (!root.terminal) {
-        final e = await pool!.evaluate(root.fen, root.stm, prep.legal);
-        _applyExpansion(root, prep, e);
-      }
+      _applyExpandResult(root, await pool!.expand(root.fen, root.stm));
     }
     _applyRootNoise(root);
 
@@ -179,42 +176,48 @@ class Mcts {
     return stats;
   }
 
-  /// Collects [count] leaves (virtual loss), evaluates the unique unexpanded
-  /// ones concurrently on the pool, then expands and backs them up.
+  /// Collects [count] leaves (virtual loss), expands the unique unexpanded ones
+  /// concurrently on the pool, then backs the values up.
   Future<void> _runBatchAsync(_Node root, int count) async {
     final paths = <List<_Node>>[];
     for (var b = 0; b < count; b++) {
       paths.add(_collectLeaf(root));
     }
     final values = <_Node, double>{};
-    final preps = <_Node, _Prep>{};
     final leaves = <_Node>[];
     for (final path in paths) {
       final leaf = path.last;
-      if (values.containsKey(leaf) || preps.containsKey(leaf)) continue;
-      if (leaf.terminal) {
-        values[leaf] = leaf.terminalValue;
+      if (values.containsKey(leaf) || leaf.children != null) {
+        if (leaf.terminal) values[leaf] = leaf.terminalValue;
         continue;
       }
-      final prep = _prepareExpand(leaf);
-      if (leaf.terminal) {
-        values[leaf] = leaf.terminalValue;
-        continue;
-      }
-      preps[leaf] = prep;
-      leaves.add(leaf);
+      if (!leaves.contains(leaf)) leaves.add(leaf);
     }
-    final results = await Future.wait([
-      for (final leaf in leaves)
-        pool!.evaluate(leaf.fen, leaf.stm, preps[leaf]!.legal),
-    ]);
+    final results = await Future.wait(
+        [for (final leaf in leaves) pool!.expand(leaf.fen, leaf.stm)]);
     for (var i = 0; i < leaves.length; i++) {
-      final leaf = leaves[i];
-      values[leaf] = _applyExpansion(leaf, preps[leaf]!, results[i]);
+      values[leaves[i]] = _applyExpandResult(leaves[i], results[i]);
     }
     for (final path in paths) {
-      _backup(path, values[path.last]!);
+      _backup(path, values[path.last] ?? path.last.terminalValue);
     }
+  }
+
+  /// Attaches children (or marks terminal) from a worker [ExpandResult] and
+  /// returns the node-POV value.
+  double _applyExpandResult(_Node node, ExpandResult r) {
+    if (r.terminal) {
+      node.terminal = true;
+      node.children = <String, _Node>{};
+      node.terminalValue = r.checkmate ? -1.0 : 0.0;
+      return node.terminalValue;
+    }
+    node.children = <String, _Node>{};
+    for (var i = 0; i < r.legal.length; i++) {
+      node.children![r.legal[i]] =
+          _Node(r.childFens[i], 1 - node.stm, r.priors[i]);
+    }
+    return r.value;
   }
 
   /// Mixes Dirichlet(alpha) noise into the root priors once per root:
@@ -386,33 +389,17 @@ class Mcts {
   /// Generates legal moves + resulting child FENs (or marks [node] terminal)
   /// without running the network, so the eval can be offloaded to a pool.
   _Prep _prepareExpand(_Node node) {
-    final board = ch.Chess.fromFEN(node.fen);
-
-    if (board.game_over) {
+    final exp = expandBoard(node.fen);
+    if (exp.gameOver) {
       node.terminal = true;
       node.children = <String, _Node>{};
-      node.terminalValue = board.in_checkmate ? -1.0 : 0.0; // mated STM loses
+      node.terminalValue = exp.checkmate ? -1.0 : 0.0; // mated STM loses
       return _Prep(const [], const {});
     }
-
-    final verbose = board.moves({'verbose': true}) as List;
-    final legal = <String>[];
-    final childFen = <String, String>{};
-    for (final mv in verbose) {
-      final m = mv as Map;
-      final from = m['from'] as String;
-      final to = m['to'] as String;
-      final promo = m['promotion'];
-      final uci =
-          from + to + (promo != null ? promo.toString().toLowerCase() : '');
-      final child = ch.Chess.fromFEN(node.fen);
-      final moveMap = <String, dynamic>{'from': from, 'to': to};
-      if (promo != null) moveMap['promotion'] = promo;
-      child.move(moveMap);
-      legal.add(uci);
-      childFen[uci] = child.fen;
-    }
-    return _Prep(legal, childFen);
+    final childFen = <String, String>{
+      for (var i = 0; i < exp.legal.length; i++) exp.legal[i]: exp.childFens[i]
+    };
+    return _Prep(exp.legal, childFen);
   }
 
   double _applyExpansion(_Node node, _Prep prep, Evaluation e) {
