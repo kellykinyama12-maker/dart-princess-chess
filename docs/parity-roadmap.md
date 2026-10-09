@@ -115,6 +115,18 @@ ships CUDA kernels for Linux/WSL2).
   ships a small WAC subset in [test/tactics.epd](../test/tactics.epd).
   `dart run bin/solve_epd.dart --nodes 2000 --workers 8`. Use it to track
   strength as nodes/net scale.
+- **Configurable net** ✅ all drivers take `--net <path>` (or `LC0_WEIGHTS` env /
+  UCI `WeightsFile`) so a stronger evaluator can be dropped in without code
+  changes. [bin/net_info.dart](../bin/net_info.dart) prints a net's architecture
+  + noise-free startpos priors to check compatibility.
+- **Net-compatibility finding** ⚠️ dart_pytorch 0.1.3's `Lc0Reader` only reliably
+  parses 744706-style SE-ResNet nets (conv policy + WDL). Tested larger nets:
+  `t1-256x10-distilled` / `t1-256x10-rl-base` are **rejected** ("missing
+  classical fields"); the 2019 `256x20-t40` **loads but is mis-parsed** (scrambled
+  policy, e.g. h2h3/a2a3 as top priors); attention-body nets (BT*, `*x…h`) are
+  unsupported. So bigger-net strength scaling is currently blocked by the reader,
+  not by this project's evaluator/search (same code gives correct priors on
+  744706). A future dart_pytorch with broader net support unlocks this lever.
 
 ## Notes / constraints
 - CPU-only here, so Stage 2 nets stay modest; GPU (WSL) unlocks Stage 5.
