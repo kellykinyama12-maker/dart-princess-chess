@@ -44,10 +44,9 @@ packages:
   dart_pytorch:
     dependency: "direct main"
     description:
-      name: dart_pytorch
-      sha256: a89ea57759f646a7cc822bc09534febe98e7bf2b5d27725696b5dfd22072145f
-      url: "https://pub.dev"
-    source: hosted
+      path: "C:\\projects\\ai_projects\\dart-pytorch"
+      relative: false
+    source: path
     version: "0.1.3"
   ffi:
     dependency: transitive
