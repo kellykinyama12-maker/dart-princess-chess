@@ -1,0 +1,12 @@
+name: chess_moves
+description: Autoregressive transformer that predicts chess moves, trained on lc0 V6 self-play data using dart_pytorch.
+publish_to: none
+version: 0.1.0
+
+environment:
+  sdk: ^3.9.3
+
+dependencies:
+  dart_pytorch: ^0.1.3
+  archive: ^4.0.7
+  chess: ^0.8.1

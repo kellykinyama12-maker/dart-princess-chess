@@ -1,0 +1,12 @@
+# Dart / pub
+.dart_tool/
+.packages
+build/
+
+# Generated + large data (not source)
+data/
+models/
+training_data/
+
+# Scratch logs
+*.log
