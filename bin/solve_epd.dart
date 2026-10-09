@@ -20,6 +20,7 @@ Future<void> main(List<String> args) async {
   int? nodes = 2000;
   int? movetime;
   var workers = 1;
+  String? net;
   final files = <String>[];
   for (var i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -31,14 +32,17 @@ Future<void> main(List<String> args) async {
         nodes = null;
       case '--workers':
         workers = int.parse(args[++i]);
+      case '--net':
+        net = args[++i];
       default:
         files.add(args[i]);
     }
   }
   if (files.isEmpty) files.add(_defaultEpd);
+  final weightsPath = net ?? Platform.environment['LC0_WEIGHTS'] ?? _weightsPath;
 
-  if (!File(_weightsPath).existsSync()) {
-    stderr.writeln('Missing $_weightsPath. Run bin/lc0_eval_smoke.dart first.');
+  if (!File(weightsPath).existsSync()) {
+    stderr.writeln('Missing $weightsPath. Run bin/lc0_eval_smoke.dart first.');
     exit(64);
   }
 
@@ -61,10 +65,10 @@ Future<void> main(List<String> args) async {
   EvalPool? pool;
   Mcts mcts;
   if (workers > 1) {
-    pool = await EvalPool.start(_weightsPath, workers);
+    pool = await EvalPool.start(weightsPath, workers);
     mcts = Mcts.pooled(pool, batchSize: workers * 2, addRootNoise: false);
   } else {
-    mcts = Mcts(Lc0Evaluator.load(_weightsPath), addRootNoise: false);
+    mcts = Mcts(Lc0Evaluator.load(weightsPath), addRootNoise: false);
   }
 
   final budget = movetime != null

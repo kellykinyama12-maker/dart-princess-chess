@@ -16,8 +16,12 @@ import 'package:chess_moves/eval_pool.dart';
 import 'package:chess_moves/lc0_evaluator.dart';
 import 'package:chess_moves/mcts.dart';
 
-const _weightsPath = 'models/lc0/744706.pb.gz';
+const _defaultWeightsPath = 'models/lc0/744706.pb.gz';
 const _startFen = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+
+// Network can be overridden via the LC0_WEIGHTS env var or `setoption WeightsFile`.
+String _resolveWeights() =>
+    Platform.environment['LC0_WEIGHTS'] ?? _defaultWeightsPath;
 
 Future<void> main() async {
   final engine = _Engine();
@@ -26,6 +30,8 @@ Future<void> main() async {
     final done = await engine.handle(line.trim());
     if (done) break;
   }
+  engine.stopSearch(); // EOF behaves like quit: end any unbounded search
+  await engine.awaitSearch();
   engine.dispose();
 }
 
@@ -33,6 +39,8 @@ class _Engine {
   int threads = 1;
   int defaultNodes = 800;
   double cpuct = 1.5;
+  bool ponderEnabled = false;
+  String weightsPath = _resolveWeights();
 
   EvalPool? _pool;
   Mcts? _mcts;
@@ -41,6 +49,11 @@ class _Engine {
   String _baseFen = _startFen;
   List<String> _moves = [];
   bool _searching = false;
+  bool _pondering = false;
+  Timer? _timer; // fires _mcts.stop() when the time budget elapses
+  int? _pendingBudgetMs; // budget to apply on ponderhit
+  Stopwatch _sw = Stopwatch();
+  Future<void>? _searchFuture;
 
   Future<bool> handle(String line) async {
     if (line.isEmpty) return false;
@@ -52,6 +65,8 @@ class _Engine {
         _out('option name Threads type spin default 1 min 1 max 64');
         _out('option name Nodes type spin default 800 min 1 max 100000000');
         _out('option name Cpuct type string default 1.5');
+        _out('option name Ponder type check default false');
+        _out('option name WeightsFile type string default $weightsPath');
         _out('uciok');
       case 'isready':
         await _ensureEngine();
@@ -64,9 +79,14 @@ class _Engine {
         _position(tok);
       case 'go':
         await _go(tok);
+      case 'ponderhit':
+        _ponderHit();
       case 'stop':
+        _timer?.cancel();
+        _timer = null;
         _mcts?.stop();
       case 'quit':
+        _mcts?.stop();
         return true;
     }
     return false;
@@ -93,20 +113,27 @@ class _Engine {
           cpuct = c;
           _disposeEngine();
         }
+      case 'ponder':
+        ponderEnabled = value.toLowerCase() == 'true';
+      case 'weightsfile':
+        if (value.isNotEmpty && value != weightsPath) {
+          weightsPath = value;
+          _disposeEngine();
+        }
     }
   }
 
   Future<void> _ensureEngine() async {
     if (_mcts != null) return;
-    if (!File(_weightsPath).existsSync()) {
-      _out('info string ERROR missing $_weightsPath (run bin/lc0_eval_smoke.dart)');
+    if (!File(weightsPath).existsSync()) {
+      _out('info string ERROR missing $weightsPath (run bin/lc0_eval_smoke.dart)');
       return;
     }
     if (threads > 1) {
-      _pool = await EvalPool.start(_weightsPath, threads);
+      _pool = await EvalPool.start(weightsPath, threads);
       _mcts = Mcts.pooled(_pool!, cPuct: cpuct, batchSize: threads * 2);
     } else {
-      final evaluator = Lc0Evaluator.load(_weightsPath);
+      final evaluator = Lc0Evaluator.load(weightsPath);
       _mcts = Mcts(evaluator, cPuct: cpuct);
     }
   }
@@ -162,56 +189,125 @@ class _Engine {
       return;
     }
     int? nodes;
-    Duration? time;
+    int? movetime, wtime, btime, winc, binc, movestogo;
+    var ponder = false;
+    final infinite = tok.contains('infinite');
     for (var i = 1; i < tok.length; i++) {
       switch (tok[i]) {
         case 'movetime':
-          time = Duration(milliseconds: int.parse(tok[++i]));
+          movetime = int.parse(tok[++i]);
         case 'nodes':
           nodes = int.parse(tok[++i]);
-        case 'infinite':
-          nodes = null;
-          time = null;
-        case 'depth': // no true depth notion; map to the default node budget
-          ++i;
         case 'wtime':
-          if (_board.turn == ch.Chess.WHITE) time = _alloc(tok, i);
-          ++i;
+          wtime = int.parse(tok[++i]);
         case 'btime':
-          if (_board.turn == ch.Chess.BLACK) time = _alloc(tok, i);
+          btime = int.parse(tok[++i]);
+        case 'winc':
+          winc = int.parse(tok[++i]);
+        case 'binc':
+          binc = int.parse(tok[++i]);
+        case 'movestogo':
+          movestogo = int.parse(tok[++i]);
+        case 'ponder':
+          ponder = true;
+        case 'depth': // no true depth notion
           ++i;
       }
     }
-    final hasInfinite = tok.contains('infinite');
-    if (nodes == null && time == null && !hasInfinite) nodes = defaultNodes;
+    final budgetMs = _computeBudgetMs(
+        movetime: movetime,
+        wtime: wtime,
+        btime: btime,
+        winc: winc,
+        binc: binc,
+        movestogo: movestogo);
 
-    _searching = true;
-    final sw = Stopwatch()..start();
     final fen = _board.fen;
-    final stats = _pool != null
-        ? await _mcts!.searchBudgetAsync(fen, nodes: nodes, time: time)
-        : _mcts!.searchBudget(fen, nodes: nodes, time: time);
-    sw.stop();
-    _searching = false;
+    _searching = true;
+    _pondering = ponder;
+    _pendingBudgetMs = budgetMs;
+    _sw = Stopwatch()..start();
+    _timer?.cancel();
+    _timer = null;
 
+    if (_pool != null) {
+      // Async + interruptible: a Timer fires stop() at the deadline; `ponder`
+      // and `infinite` run until ponderhit/stop.
+      if (!ponder && !infinite && budgetMs != null) {
+        _timer = Timer(Duration(milliseconds: budgetMs), () => _mcts?.stop());
+      }
+      _searchFuture = _runAsyncSearch(fen, nodes);
+    } else {
+      // Sync blocking search can't be interrupted; bound it by nodes or a
+      // captured time budget (ponder/infinite fall back to a node budget).
+      Duration? time;
+      if (!ponder && !infinite && budgetMs != null) {
+        time = Duration(milliseconds: budgetMs);
+      }
+      if (time == null && nodes == null) nodes = defaultNodes;
+      _finishSearch(_mcts!.searchBudget(fen, nodes: nodes, time: time));
+    }
+  }
+
+  Future<void> _runAsyncSearch(String fen, int? nodes) async {
+    try {
+      _finishSearch(await _mcts!.searchBudgetAsync(fen, nodes: nodes));
+    } catch (_) {
+      // engine disposed mid-search (e.g. quit) — ignore
+    }
+  }
+
+  void _ponderHit() {
+    if (!_pondering) return;
+    _pondering = false;
+    final b = _pendingBudgetMs;
+    if (b != null) {
+      _timer?.cancel();
+      _timer = Timer(Duration(milliseconds: b), () => _mcts?.stop());
+    }
+  }
+
+  void _finishSearch(List<MoveStat> stats) {
+    _timer?.cancel();
+    _timer = null;
+    _sw.stop();
+    _searching = false;
+    _pondering = false;
     if (stats.isEmpty) {
       _out('bestmove 0000');
       return;
     }
     final best = stats.first;
-    final nps = sw.elapsedMilliseconds > 0
-        ? (_mcts!.rootVisits * 1000 ~/ sw.elapsedMilliseconds)
-        : 0;
+    final ms = _sw.elapsedMilliseconds;
+    final nps = ms > 0 ? (_mcts!.rootVisits * 1000 ~/ ms) : 0;
     final pv = _mcts!.principalVariation();
     final cp = _toCentipawns(-best.q); // side-to-move POV
     _out('info depth ${pv.length} nodes ${_mcts!.rootVisits} nps $nps '
-        'score cp $cp time ${sw.elapsedMilliseconds} pv ${pv.join(' ')}');
-    _out('bestmove ${best.uci}');
+        'score cp $cp time $ms pv ${pv.join(' ')}');
+    final ponderMove =
+        (ponderEnabled && pv.length >= 2) ? ' ponder ${pv[1]}' : '';
+    _out('bestmove ${best.uci}$ponderMove');
   }
 
-  Duration _alloc(List<String> tok, int i) {
-    final ms = int.parse(tok[i + 1]);
-    return Duration(milliseconds: math.max(50, ms ~/ 30));
+  /// Time to spend this move in ms, or null for no time limit.
+  int? _computeBudgetMs(
+      {int? movetime,
+      int? wtime,
+      int? btime,
+      int? winc,
+      int? binc,
+      int? movestogo}) {
+    if (movetime != null) return movetime;
+    final white = _board.turn == ch.Chess.WHITE;
+    final my = white ? wtime : btime;
+    if (my == null) return null; // no clock info (nodes-only / infinite)
+    final inc = (white ? winc : binc) ?? 0;
+    final mtg = (movestogo != null && movestogo > 0) ? movestogo : 30;
+    const overhead = 30; // communication/safety margin
+    final alloc = my ~/ (mtg + 1) + (inc * 3 ~/ 4);
+    final cap = ((my - overhead) * 4) ~/ 5; // never spend >80% of the clock
+    if (cap < 10) return math.max(1, my - overhead); // in time trouble
+    return alloc.clamp(10, cap);
   }
 
   int _toCentipawns(double q) {
@@ -237,6 +333,19 @@ class _Engine {
   }
 
   void dispose() => _disposeEngine();
+
+  void stopSearch() {
+    _timer?.cancel();
+    _timer = null;
+    _mcts?.stop();
+  }
+
+  /// Waits for any in-flight detached search to finish (emitting its bestmove).
+  Future<void> awaitSearch() async {
+    try {
+      await _searchFuture;
+    } catch (_) {}
+  }
 
   void _out(String s) {
     stdout.writeln(s);

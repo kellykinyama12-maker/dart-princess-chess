@@ -30,6 +30,7 @@ Future<void> main(List<String> args) async {
   var tempMoves = 0;
   var fpu = 0.2;
   int? seed;
+  String? net;
   final rest = <String>[];
   for (var i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -49,14 +50,17 @@ Future<void> main(List<String> args) async {
         fpu = double.parse(args[++i]);
       case '--seed':
         seed = int.parse(args[++i]);
+      case '--net':
+        net = args[++i];
       default:
         rest.add(args[i]);
     }
   }
   final fen = rest.isNotEmpty ? rest.join(' ') : _startFen;
+  final weightsPath = net ?? Platform.environment['LC0_WEIGHTS'] ?? _weightsPath;
 
-  if (!File(_weightsPath).existsSync()) {
-    stderr.writeln('Missing $_weightsPath. Run bin/lc0_eval_smoke.dart first to '
+  if (!File(weightsPath).existsSync()) {
+    stderr.writeln('Missing $weightsPath. Run bin/lc0_eval_smoke.dart first to '
         'download the lc0 weights.');
     exit(64);
   }
@@ -69,11 +73,11 @@ Future<void> main(List<String> args) async {
   if (workers > 1) {
     stdout.writeln('cpus: ${Platform.numberOfProcessors}  '
         'starting $workers eval isolates (CPU) ...');
-    pool = await EvalPool.start(_weightsPath, workers);
+    pool = await EvalPool.start(weightsPath, workers);
     mcts = Mcts.pooled(pool, batchSize: batch, fpuReduction: fpu, seed: seed);
   } else {
     stdout.writeln('loading lc0 net (CPU) ...');
-    final evaluator = Lc0Evaluator.load(_weightsPath, device: Device.CPU);
+    final evaluator = Lc0Evaluator.load(weightsPath, device: Device.CPU);
     mcts = Mcts(evaluator, batchSize: batch, fpuReduction: fpu, seed: seed);
   }
 
