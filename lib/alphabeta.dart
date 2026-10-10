@@ -90,11 +90,38 @@ class AlphaBeta {
       const beta = _inf;
       var localBest = -_inf;
       ch.Move? localBestMove;
+      final inCheck = _b.king_attacked(_b.turn);
+      var moveCount = 0;
       for (final m in rootMoves) {
+        final isQuiet = (m.flags &
+                (ch.Chess.BITS_CAPTURE |
+                    ch.Chess.BITS_EP_CAPTURE |
+                    ch.Chess.BITS_PROMOTION)) ==
+            0;
+        final liked = _netLikes(m, rootPriors); // never reduce a move MCTS likes
         _b.make_move(m);
-        final score = -_negamax(depth - 1, -beta, -alpha, 1);
+        final givesCheck = _b.king_attacked(_b.turn);
+        int score;
+        if (moveCount == 0) {
+          score = -_negamax(depth - 1, -beta, -alpha, 1);
+        } else {
+          var r = 0;
+          if (depth >= 3 &&
+              moveCount >= 4 &&
+              isQuiet &&
+              !liked &&
+              !inCheck &&
+              !givesCheck) {
+            r = 1;
+          }
+          score = -_negamax(depth - 1 - r, -alpha - 1, -alpha, 1);
+          if (!_aborted && score > alpha) {
+            score = -_negamax(depth - 1, -beta, -alpha, 1);
+          }
+        }
         _b.undo_move();
         if (_aborted) break;
+        moveCount++;
         if (score > localBest) {
           localBest = score;
           localBestMove = m;
@@ -142,14 +169,40 @@ class AlphaBeta {
     }
     _order(moves, ttMove);
 
+    final inCheck = _b.king_attacked(_b.turn);
     final origAlpha = alpha;
     var best = -_inf;
     ch.Move? bestMove;
+    var moveCount = 0;
     for (final m in moves) {
+      final isQuiet = (m.flags &
+              (ch.Chess.BITS_CAPTURE |
+                  ch.Chess.BITS_EP_CAPTURE |
+                  ch.Chess.BITS_PROMOTION)) ==
+          0;
       _b.make_move(m);
-      final score = -_negamax(depth - 1, -beta, -alpha, ply + 1);
+      final givesCheck = _b.king_attacked(_b.turn);
+      int score;
+      if (moveCount == 0) {
+        score = -_negamax(depth - 1, -beta, -alpha, ply + 1);
+      } else {
+        var r = 0;
+        if (depth >= 3 &&
+            ply >= 3 &&
+            moveCount >= 4 &&
+            isQuiet &&
+            !inCheck &&
+            !givesCheck) {
+          r = 1;
+        }
+        score = -_negamax(depth - 1 - r, -alpha - 1, -alpha, ply + 1);
+        if (!_aborted && score > alpha) {
+          score = -_negamax(depth - 1, -beta, -alpha, ply + 1);
+        }
+      }
       _b.undo_move();
       if (_aborted) return 0;
+      moveCount++;
       if (score > best) {
         best = score;
         bestMove = m;
@@ -161,6 +214,15 @@ class AlphaBeta {
     final flag = best <= origAlpha ? 2 : (best >= beta ? 1 : 0);
     _store(key, depth, best, flag, bestMove);
     return best;
+  }
+
+  /// Whether the net policy ([priors], move UCI -> prior) rates [m] highly
+  /// enough that it should never be depth-reduced (a move MCTS likes).
+  bool _netLikes(ch.Move m, Map<String, double>? priors) {
+    if (priors == null) return false;
+    final uci = m.fromAlgebraic + m.toAlgebraic + (m.promotion?.name ?? '');
+    final p = priors[uci];
+    return p != null && p >= 0.05;
   }
 
   /// Capture/promotion-only search to a quiet position (avoids horizon tactics).
