@@ -151,11 +151,15 @@ class _Engine {
     if (threads > 1) {
       _pool = await EvalPool.start(weightsPath, threads);
       _mcts = Mcts.pooled(_pool!,
-          cPuct: cpuct, batchSize: threads * 2, transpositions: useTT);
+          cPuct: cpuct,
+          batchSize: threads * 2,
+          transpositions: useTT,
+          addRootNoise: false);
       if (useAb) _ab = await AbWorker.start();
     } else {
       final evaluator = Lc0Evaluator.load(weightsPath);
-      _mcts = Mcts(evaluator, cPuct: cpuct, transpositions: useTT);
+      _mcts = Mcts(evaluator,
+          cPuct: cpuct, transpositions: useTT, addRootNoise: false);
     }
   }
 
