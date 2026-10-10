@@ -22,6 +22,7 @@ Future<void> main(List<String> args) async {
   int? movetime;
   var workers = 1;
   var useAb = false;
+  var abCx = false; // use the complexity-budget AB search in the worker
   String? net;
   final files = <String>[];
   for (var i = 0; i < args.length; i++) {
@@ -36,6 +37,8 @@ Future<void> main(List<String> args) async {
         workers = int.parse(args[++i]);
       case '--ab':
         useAb = true;
+      case '--abcx':
+        abCx = true;
       case '--net':
         net = args[++i];
       default:
@@ -75,7 +78,7 @@ Future<void> main(List<String> args) async {
     mcts = Mcts(Lc0Evaluator.load(weightsPath), addRootNoise: false);
   }
 
-  final ab = useAb ? await AbWorker.start() : null;
+  final ab = useAb ? await AbWorker.start(complexity: abCx) : null;
 
   final budget = movetime != null
       ? 'movetime ${movetime}ms'

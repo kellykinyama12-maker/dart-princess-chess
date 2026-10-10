@@ -65,9 +65,9 @@ class AbWorker {
     });
   }
 
-  static Future<AbWorker> start() async {
+  static Future<AbWorker> start({bool complexity = false}) async {
     final ready = ReceivePort();
-    final iso = await Isolate.spawn(_abMain, ready.sendPort);
+    final iso = await Isolate.spawn(_abMain, [ready.sendPort, complexity]);
     final send = await ready.first as SendPort;
     ready.close();
     return AbWorker._(iso, send, ReceivePort());
@@ -93,8 +93,10 @@ class AbWorker {
   }
 }
 
-void _abMain(SendPort ready) {
-  final ab = AlphaBeta(); // persistent transposition table
+void _abMain(List args) {
+  final ready = args[0] as SendPort;
+  final complexity = args[1] as bool;
+  final ab = AlphaBeta(complexity: complexity); // persistent transposition table
   final port = ReceivePort();
   ready.send(port.sendPort);
   port.listen((msg) {
