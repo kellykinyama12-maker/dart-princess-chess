@@ -22,13 +22,14 @@ class Nnue {
   final Int16List _ftBias; // [256]
   final Int16List _ftWeights; // [41024 * 256], row = feature
 
-  // Affine layers: biases int32, weights int8 (row-major [out][in]).
-  final Int32List _l1Bias; // [32]
-  final Int8List _l1Weights; // [32 * 512]
-  final Int32List _l2Bias; // [32]
-  final Int8List _l2Weights; // [32 * 32]
-  final Int32List _l3Bias; // [1]
-  final Int8List _l3Weights; // [32]
+  // Affine layers as float (int values stay exact in float32) for SIMD; weights
+  // row-major [out][in].
+  final Float32List _l1Bias; // [32]
+  final Float32List _l1Weights; // [32 * 512]
+  final Float32List _l2Bias; // [32]
+  final Float32List _l2Weights; // [32 * 32]
+  final Float32List _l3Bias; // [1]
+  final Float32List _l3Weights; // [32]
 
   Nnue._(this._ftBias, this._ftWeights, this._l1Bias, this._l1Weights,
       this._l2Bias, this._l2Weights, this._l3Bias, this._l3Weights);
@@ -70,19 +71,19 @@ class Nnue {
     }
 
     o += 4; // network section hash
-    Int32List readBias(int n) {
-      final b = Int32List(n);
+    Float32List readBias(int n) {
+      final b = Float32List(n);
       for (var i = 0; i < n; i++) {
-        b[i] = bd.getInt32(o, Endian.little);
+        b[i] = bd.getInt32(o, Endian.little).toDouble();
         o += 4;
       }
       return b;
     }
 
-    Int8List readWeights(int n) {
-      final w = Int8List(n);
+    Float32List readWeights(int n) {
+      final w = Float32List(n);
       for (var i = 0; i < n; i++) {
-        w[i] = bd.getInt8(o);
+        w[i] = bd.getInt8(o).toDouble();
         o += 1;
       }
       return w;
@@ -123,9 +124,17 @@ class Nnue {
     }
   }
 
-  /// Evaluates [board] in centipawns from the side-to-move perspective.
+  /// Evaluates [board] in centipawns from the side-to-move perspective
+  /// (full recompute; searchers use [NnueAccumulator] for incremental updates).
   int evaluate(ch.Chess board) {
-    // Collect pieces (a1=0 numbering) and king squares.
+    final accW = Int32List(_kHalfDims);
+    final accB = Int32List(_kHalfDims);
+    refreshAcc(accW, accB, board);
+    return _evalFromAcc(accW, accB, board.turn == ch.Chess.WHITE);
+  }
+
+  /// Full recompute of both perspective accumulators from [board].
+  void refreshAcc(Int32List accW, Int32List accB, ch.Chess board) {
     final sqs = <int>[];
     final codes = <int>[];
     var wKing = 0, bKing = 0;
@@ -150,48 +159,173 @@ class Nnue {
         codes.add(code);
       }
     }
-
-    final accW = Int32List(_kHalfDims);
-    final accB = Int32List(_kHalfDims);
     _accumulate(accW, 0, wKing, sqs, codes);
     _accumulate(accB, 1, bKing, sqs, codes);
+  }
 
-    // Own perspective first in the transformed input.
-    final whiteToMove = board.turn == ch.Chess.WHITE;
+  /// King square (a1=0) of [white] on [board].
+  int kingSq(ch.Chess board, bool white) {
+    final target = white ? ch.Chess.WHITE : ch.Chess.BLACK;
+    for (var i = ch.Chess.SQUARES_A8; i <= ch.Chess.SQUARES_H1; i++) {
+      if ((i & 0x88) != 0) {
+        i += 7;
+        continue;
+      }
+      final pc = board.board[i];
+      if (pc != null && pc.type == ch.PieceType.KING && pc.color == target) {
+        return (i & 7) + 8 * (7 - (i >> 4));
+      }
+    }
+    return 0;
+  }
+
+  /// Incrementally updates both accumulators for a non-king, non-castling move
+  /// [m] (kings unchanged at [wKing]/[bKing], a1=0).
+  void applyNonKingMove(
+      Int32List accW, Int32List accB, int wKing, int bKing, ch.Move m) {
+    final white = m.color == ch.Chess.WHITE;
+    final movedCode = white ? 6 - m.piece.shift : 12 - m.piece.shift;
+    final fromSq = (m.from & 7) + 8 * (7 - (m.from >> 4));
+    final toSq = (m.to & 7) + 8 * (7 - (m.to >> 4));
+    final finalType = m.promotion ?? m.piece;
+    final finalCode = white ? 6 - finalType.shift : 12 - finalType.shift;
+    var capSq = -1, capCode = 0;
+    final captured = m.captured;
+    if (captured != null) {
+      capCode = white ? 12 - captured.shift : 6 - captured.shift;
+      capSq = (m.flags & ch.Chess.BITS_EP_CAPTURE) != 0
+          ? (white ? toSq - 8 : toSq + 8)
+          : toSq;
+    }
+    final wko = wKing; // orient(0, wKing)
+    final bko = bKing ^ 63; // orient(1, bKing)
+    _delta(accW, 0, fromSq, movedCode, wko, -1);
+    _delta(accW, 0, toSq, finalCode, wko, 1);
+    if (capSq >= 0) _delta(accW, 0, capSq, capCode, wko, -1);
+    _delta(accB, 1, fromSq, movedCode, bko, -1);
+    _delta(accB, 1, toSq, finalCode, bko, 1);
+    if (capSq >= 0) _delta(accB, 1, capSq, capCode, bko, -1);
+  }
+
+  void _delta(Int32List acc, int perspective, int sq, int code, int kingOriented,
+      int sign) {
+    final f = _orient(perspective, sq) +
+        _pieceToIndex[perspective][code] +
+        _psEnd * kingOriented;
+    final wOff = f * _kHalfDims;
+    if (sign > 0) {
+      for (var i = 0; i < _kHalfDims; i++) {
+        acc[i] += _ftWeights[wOff + i];
+      }
+    } else {
+      for (var i = 0; i < _kHalfDims; i++) {
+        acc[i] -= _ftWeights[wOff + i];
+      }
+    }
+  }
+
+  /// Forward pass from prebuilt accumulators -> side-to-move centipawns.
+  int _evalFromAcc(Int32List accW, Int32List accB, bool whiteToMove) {
     final own = whiteToMove ? accW : accB;
     final opp = whiteToMove ? accB : accW;
-
-    final input = Uint8List(_transformed);
+    final input = Float32List(_transformed);
     for (var i = 0; i < _kHalfDims; i++) {
-      input[i] = _clamp8(own[i]);
-      input[_kHalfDims + i] = _clamp8(opp[i]);
+      input[i] = _clamp8(own[i]).toDouble();
+      input[_kHalfDims + i] = _clamp8(opp[i]).toDouble();
     }
-
-    final h1 = _affineClipped(input, _l1Bias, _l1Weights, 32, 512);
-    final h2 = _affineClipped(h1, _l2Bias, _l2Weights, 32, 32);
-
-    var out = _l3Bias[0];
-    for (var i = 0; i < 32; i++) {
-      out += _l3Weights[i] * h2[i];
+    final h1 = _affineRelu(input, _l1Bias, _l1Weights, 32, 512);
+    final h2 = _affineRelu(h1, _l2Bias, _l2Weights, 32, 32);
+    final wv =
+        Float32x4List.view(_l3Weights.buffer, _l3Weights.offsetInBytes, 8);
+    final xv = Float32x4List.view(h2.buffer, h2.offsetInBytes, 8);
+    var acc = Float32x4.zero();
+    for (var i = 0; i < 8; i++) {
+      acc += wv[i] * xv[i];
     }
+    final out = (acc.x + acc.y + acc.z + acc.w + _l3Bias[0]).toInt();
     return out ~/ _fvScale;
   }
 
   static int _clamp8(int v) => v < 0 ? 0 : (v > 127 ? 127 : v);
 
-  /// Affine transform (int8 weights row-major [out][in]) followed by a
-  /// clipped-ReLU with the 6-bit weight scale.
-  Uint8List _affineClipped(
-      Uint8List input, Int32List bias, Int8List weights, int outDim, int inDim) {
-    final out = Uint8List(outDim);
+  /// Affine transform (SIMD) followed by clipped-ReLU with the 6-bit weight
+  /// scale. [weights] is row-major [out][in]; products stay exact in float32.
+  Float32List _affineRelu(Float32List input, Float32List bias,
+      Float32List weights, int outDim, int inDim) {
+    final out = Float32List(outDim);
+    final n4 = inDim >> 2;
+    final xv = Float32x4List.view(input.buffer, input.offsetInBytes, n4);
     for (var j = 0; j < outDim; j++) {
-      var sum = bias[j];
-      final wOff = j * inDim;
-      for (var i = 0; i < inDim; i++) {
-        sum += weights[wOff + i] * input[i];
+      final wv = Float32x4List.view(
+          weights.buffer, weights.offsetInBytes + j * inDim * 4, n4);
+      var acc = Float32x4.zero();
+      for (var i = 0; i < n4; i++) {
+        acc += wv[i] * xv[i];
       }
-      out[j] = _clamp8(sum >> _weightScaleBits);
+      final sum = (acc.x + acc.y + acc.z + acc.w + bias[j]).toInt();
+      out[j] = (sum >> _weightScaleBits).clamp(0, 127).toDouble();
     }
     return out;
   }
 }
+
+/// Incremental HalfKP accumulator stack for a search: push on make_move, pop on
+/// undo_move. King/castling moves trigger a full refresh (the king square
+/// reindexes every feature of that perspective); other moves apply piece deltas.
+class NnueAccumulator {
+  final Nnue net;
+  final List<Int32List> _w = [];
+  final List<Int32List> _b = [];
+  final List<int> _wk = [];
+  final List<int> _bk = [];
+  int _sp = -1;
+
+  NnueAccumulator(this.net);
+
+  void _ensure(int level) {
+    while (_w.length <= level) {
+      _w.add(Int32List(256));
+      _b.add(Int32List(256));
+      _wk.add(0);
+      _bk.add(0);
+    }
+  }
+
+  /// Resets the stack to [board] at level 0.
+  void reset(ch.Chess board) {
+    _ensure(0);
+    _sp = 0;
+    net.refreshAcc(_w[0], _b[0], board);
+    _wk[0] = net.kingSq(board, true);
+    _bk[0] = net.kingSq(board, false);
+  }
+
+  /// Pushes the accumulator after making [m] ([boardAfter] is the post-move
+  /// position).
+  void push(ch.Move m, ch.Chess boardAfter) {
+    final sp = _sp;
+    _ensure(sp + 1);
+    _sp = sp + 1;
+    final nw = _w[_sp], nb = _b[_sp];
+    final kingMove = m.piece == ch.PieceType.KING ||
+        (m.flags &
+                (ch.Chess.BITS_KSIDE_CASTLE | ch.Chess.BITS_QSIDE_CASTLE)) !=
+            0;
+    if (kingMove) {
+      net.refreshAcc(nw, nb, boardAfter);
+      _wk[_sp] = net.kingSq(boardAfter, true);
+      _bk[_sp] = net.kingSq(boardAfter, false);
+    } else {
+      nw.setAll(0, _w[sp]);
+      nb.setAll(0, _b[sp]);
+      _wk[_sp] = _wk[sp];
+      _bk[_sp] = _bk[sp];
+      net.applyNonKingMove(nw, nb, _wk[_sp], _bk[_sp], m);
+    }
+  }
+
+  void pop() => _sp--;
+
+  int eval(bool whiteToMove) => net._evalFromAcc(_w[_sp], _b[_sp], whiteToMove);
+}
+

@@ -52,6 +52,9 @@ class AlphaBeta {
   // calibrated.
   final Nnue? nnue;
   static const int _nnueScale = 3;
+  // Incremental NNUE accumulator (push on make, pop on undo) when [nnue] is set.
+  late final NnueAccumulator? _acc =
+      nnue != null ? NnueAccumulator(nnue!) : null;
 
   // Complexity-budget search: "depth" is the number of quiet moves in a line;
   // forcing moves (checks, replies to check, captures, promotions, castling)
@@ -94,6 +97,18 @@ class AlphaBeta {
 
   int get nodes => _nodes;
 
+  /// make_move + incremental accumulator push.
+  void _makeMove(ch.Move m) {
+    _b.make_move(m);
+    _acc?.push(m, _b);
+  }
+
+  /// undo_move + incremental accumulator pop.
+  void _undoMove() {
+    _b.undo_move();
+    _acc?.pop();
+  }
+
   /// Iterative-deepening search of [fen]. Stops at [maxDepth] or when [time]
   /// elapses (whichever first). A found mate ends the search early. When
   /// [rootPriors] (move UCI -> net policy prior, typically from the MCTS tree)
@@ -103,6 +118,7 @@ class AlphaBeta {
     _b.load(fen, check_validity: false);
     _deadline = time == null ? null : DateTime.now().add(time);
     _nodes = 0;
+    _acc?.reset(_b);
     if (complexity) return _searchComplexity(maxDepth, rootPriors);
 
     ch.Move? bestMove;
@@ -173,7 +189,7 @@ class AlphaBeta {
                   ch.Chess.BITS_PROMOTION)) ==
           0;
       final liked = _netLikes(m, priors); // never reduce a move MCTS likes
-      _b.make_move(m);
+      _makeMove(m);
       final givesCheck = _b.king_attacked(_b.turn);
       int score;
       if (moveCount == 0) {
@@ -193,7 +209,7 @@ class AlphaBeta {
           score = -_negamax(depth - 1, -beta, -alpha, 1);
         }
       }
-      _b.undo_move();
+      _undoMove();
       if (_aborted) break;
       moveCount++;
       if (score > localBest) {
@@ -270,14 +286,14 @@ class AlphaBeta {
                   ch.Chess.BITS_EP_CAPTURE |
                   ch.Chess.BITS_PROMOTION)) ==
           0;
-      _b.make_move(m);
+      _makeMove(m);
       final givesCheck = _b.king_attacked(_b.turn);
       if (canFutility &&
           moveCount > 0 &&
           isQuiet &&
           !givesCheck &&
           futilityBase + depth * 150 <= alpha) {
-        _b.undo_move();
+        _undoMove();
         continue;
       }
       int score;
@@ -298,7 +314,7 @@ class AlphaBeta {
           score = -_negamax(depth - 1, -beta, -alpha, ply + 1);
         }
       }
-      _b.undo_move();
+      _undoMove();
       if (_aborted) return 0;
       moveCount++;
       if (score > best) {
@@ -334,11 +350,11 @@ class AlphaBeta {
       var localBest = -_inf;
       ch.Move? localBestMove;
       for (final m in rootMoves) {
-        _b.make_move(m);
+        _makeMove(m);
         final cost =
             (inCheck || _isForcing(m, _b.king_attacked(_b.turn))) ? 0 : 1;
         final score = -_negamaxC(budget - cost, -beta, -alpha, 1);
-        _b.undo_move();
+        _undoMove();
         if (_aborted) break;
         if (score > localBest) {
           localBest = score;
@@ -513,12 +529,12 @@ class AlphaBeta {
       var bestExcl = -_inf;
       for (final m in moves) {
         if (m.from == ttMove.from && m.to == ttMove.to) continue;
-        _b.make_move(m);
+        _makeMove(m);
         final forcing = inCheck || _isForcing(m, _b.king_attacked(_b.turn));
         final cost = forcing ? 0 : (1 + ply ~/ _quietStep);
         final s =
             -_negamaxC(singBudget - cost, -target, -(target - 1), ply + 1);
-        _b.undo_move();
+        _undoMove();
         if (_aborted) return 0;
         if (s > bestExcl) bestExcl = s;
         if (bestExcl >= target) break;
@@ -534,7 +550,7 @@ class AlphaBeta {
       if (atLeaf && (m.flags & tacticalMask) == 0) continue;
       final losing = (m.flags & captureMask) != 0 && _losingCapture(m);
       if (atLeaf && losing) continue; // quiescence skips losing captures
-      _b.make_move(m);
+      _makeMove(m);
       final givesCheck = _b.king_attacked(_b.turn);
       // Forcing (cost 0): checks, replies to check, promotions/castling, and
       // winning/equal captures. Losing captures cost budget so they don't
@@ -550,7 +566,7 @@ class AlphaBeta {
       }
       final cost = forcing ? 0 : (1 + ply ~/ _quietStep);
       final score = -_negamaxC(budget - cost, -beta, -alpha, ply + 1);
-      _b.undo_move();
+      _undoMove();
       if (_aborted) return 0;
       if (score > best) {
         best = score;
@@ -608,9 +624,9 @@ class AlphaBeta {
     _order(caps, null);
 
     for (final m in caps) {
-      _b.make_move(m);
+      _makeMove(m);
       final score = -_quiesce(-beta, -alpha, ply + 1);
-      _b.undo_move();
+      _undoMove();
       if (score >= beta) return beta;
       if (score > alpha) alpha = score;
     }
@@ -620,8 +636,9 @@ class AlphaBeta {
   /// Evaluation from side-to-move POV. Uses NNUE when available, else a
   /// material + piece-square-table estimate.
   int _evalStm() {
-    final nn = nnue;
-    if (nn != null) return nn.evaluate(_b) ~/ _nnueScale;
+    if (nnue != null) {
+      return _acc!.eval(_b.turn == ch.Chess.WHITE) ~/ _nnueScale;
+    }
     var white = 0;
     for (var i = ch.Chess.SQUARES_A8; i <= ch.Chess.SQUARES_H1; i++) {
       if ((i & 0x88) != 0) {
@@ -762,7 +779,6 @@ class AlphaBeta {
   }
 
   bool _timeUp() => _deadline != null && !DateTime.now().isBefore(_deadline!);
-
   String _uci(ch.Move m) =>
       m.fromAlgebraic + m.toAlgebraic + (m.promotion?.name ?? '');
 
