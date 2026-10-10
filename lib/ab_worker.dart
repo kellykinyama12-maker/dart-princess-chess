@@ -86,19 +86,6 @@ class AbWorker {
     return c.future;
   }
 
-  /// Evaluates each of [fens] to its paired entry in [depths] (the per-position
-  /// iterative-deepening cap), each capped at [perMs] ms, reusing the persistent
-  /// TT. Used by the MCTS unified rollout so AB runs off the main isolate,
-  /// overlapping the net evaluations in flight. Returns one AbInfo per fen.
-  Future<List<AbInfo>> rollout(
-      List<String> fens, List<int> depths, int perMs) {
-    final id = _nextId++;
-    final c = Completer<List<AbInfo>>();
-    _pending[id] = c;
-    _send.send([id, fens, depths, perMs, _recv.sendPort, 'rollout']);
-    return c.future;
-  }
-
   void dispose() {
     _send.send(null);
     _iso.kill(priority: Isolate.immediate);
@@ -117,21 +104,6 @@ void _abMain(SendPort ready) {
     }
     final list = msg as List;
     final id = list[0] as int;
-    // Rollout request: [id, fens, depths, perMs, reply, 'rollout'].
-    if (list.length >= 6 && list[5] == 'rollout') {
-      final fens = (list[1] as List).cast<String>();
-      final depths = (list[2] as List).cast<int>();
-      final perMs = list[3] as int;
-      final reply = list[4] as SendPort;
-      final rows = <List>[];
-      for (var i = 0; i < fens.length; i++) {
-        final r = ab.search(fens[i],
-            maxDepth: depths[i], time: Duration(milliseconds: perMs));
-        rows.add([fens[i], r.bestUci, r.scoreCp, r.depth, r.isMate]);
-      }
-      reply.send([id, rows]);
-      return;
-    }
     final fens = (list[1] as List).cast<String>();
     final priors = (list[2] as List).cast<Map<String, double>?>();
     final budgetMs = list[3] as int;

@@ -22,7 +22,6 @@ Future<void> main(List<String> args) async {
   int? movetime;
   var workers = 1;
   var useAb = false;
-  var abLatency = false; // run AB on the frontier leaf during net latency
   String? net;
   final files = <String>[];
   for (var i = 0; i < args.length; i++) {
@@ -37,8 +36,6 @@ Future<void> main(List<String> args) async {
         workers = int.parse(args[++i]);
       case '--ab':
         useAb = true;
-      case '--ablatency':
-        abLatency = true;
       case '--net':
         net = args[++i];
       default:
@@ -73,8 +70,7 @@ Future<void> main(List<String> args) async {
   Mcts mcts;
   if (workers > 1) {
     pool = await EvalPool.start(weightsPath, workers);
-    mcts = Mcts.pooled(pool,
-        batchSize: workers * 2, addRootNoise: false, abLatency: abLatency);
+    mcts = Mcts.pooled(pool, batchSize: workers * 2, addRootNoise: false);
   } else {
     mcts = Mcts(Lc0Evaluator.load(weightsPath), addRootNoise: false);
   }
@@ -171,7 +167,6 @@ Future<void> main(List<String> args) async {
       'avg ${(totalMs / puzzles.length).toStringAsFixed(0)} ms/pos');
   pool?.dispose();
   ab?.dispose();
-  mcts.dispose();
 }
 
 Duration? _dur(int? ms) => ms == null ? null : Duration(milliseconds: ms);

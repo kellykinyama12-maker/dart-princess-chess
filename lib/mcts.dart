@@ -3,7 +3,6 @@ import 'dart:math' as math;
 
 import 'package:chess/chess.dart' as ch;
 
-import 'ab_worker.dart';
 import 'board_expand.dart';
 import 'eval_pool.dart';
 import 'lc0_evaluator.dart';
@@ -44,9 +43,7 @@ class _Node {
   int get vloss => _s.vloss;
   set vloss(int v) => _s.vloss = v;
   int get abWeight => _s.abWeight;
-  set abWeight(int v) => _s.abWeight = v;
   double get abValue => _s.abValue;
-  set abValue(double v) => _s.abValue = v;
 
   /// Value estimate blending MCTS visits with the AB value prior.
   double get q {
@@ -78,22 +75,7 @@ class Mcts {
   final double fpuReduction; // penalty applied to unvisited children (FPU)
   final int batchSize; // >1 collects a batch of distinct leaves via virtual loss
   final bool transpositions; // share stats across nodes with the same Zobrist key
-  // When set (pooled path only), each batch runs an alpha-beta search on the
-  // frontier leaf while the net evaluation is in flight, blending the result
-  // in as a value prior — using the otherwise-idle net latency for free.
-  final bool abLatency;
   final math.Random _rng;
-
-  // Depth cap for the alpha-beta search; it is otherwise bounded by the net
-  // latency (so it runs "for free" until the net results arrive).
-  static const int _abMaxDepth = 10;
-  double _nnLatencyMs = 20; // rolling estimate of a net batch's wall time
-
-  // Off-main-isolate AB searcher for the latency-filled rollout, so alpha-beta
-  // runs concurrently with the net evaluations in flight (spawned lazily the
-  // first time it is needed, kept across searches for TT reuse).
-  AbWorker? _abWorker;
-  Future<AbWorker>? _abWorkerStarting;
 
   _Node? _root; // persisted across searches to enable tree reuse
   final Map<int, _Stats> _tt = {}; // Zobrist key -> shared stats
@@ -108,7 +90,6 @@ class Mcts {
     this.fpuReduction = 0.2,
     this.batchSize = 1,
     this.transpositions = true,
-    this.abLatency = false,
     int? seed,
   })  : pool = null,
         _rng = math.Random(seed);
@@ -124,7 +105,6 @@ class Mcts {
     this.fpuReduction = 0.2,
     this.batchSize = 8,
     this.transpositions = true,
-    this.abLatency = false,
     int? seed,
   })  : eval = null,
         _rng = math.Random(seed);
@@ -183,13 +163,6 @@ class Mcts {
   void reset() {
     _root = null;
     _tt.clear();
-  }
-
-  /// Releases the rollout AB worker isolate, if one was spawned.
-  void dispose() {
-    _abWorker?.dispose();
-    _abWorker = null;
-    _abWorkerStarting = null;
   }
 
   /// Stat transfer from alpha-beta: records [value] (position side-to-move POV,
@@ -345,10 +318,7 @@ class Mcts {
   }
 
   /// Collects [count] leaves (virtual loss), expands the unique unexpanded ones
-  /// concurrently on the pool, then backs the values up. While the net batch is
-  /// in flight, an alpha-beta search runs on the frontier leaf (off the main
-  /// isolate, bounded by the net latency) and its score is blended into that
-  /// leaf as a value prior.
+  /// concurrently on the pool, then backs the values up.
   Future<void> _runBatchAsync(_Node root, int count) async {
     final paths = <List<_Node>>[];
     for (var b = 0; b < count; b++) {
@@ -364,56 +334,14 @@ class Mcts {
       }
       if (!leaves.contains(leaf)) leaves.add(leaf);
     }
-    // Launch the net batch; spend its latency on an alpha-beta search of the
-    // root child the search currently favours, blending the score back as a
-    // prior so it steers the root decision (a node MCTS has already visited,
-    // and visited enough that the AB weight stays balanced).
-    final sw = Stopwatch()..start();
-    final nnFuture = Future.wait(
+    final results = await Future.wait(
         [for (final leaf in leaves) pool!.expand(leaf.fen, leaf.stm, leaf.key)]);
-    _Node? abNode;
-    Future<List<AbInfo>>? abFuture;
-    if (abLatency && paths.first.length > 1) {
-      final cand = paths.first[1]; // root child on the first (greedy) rollout
-      if (!cand.terminal) {
-        abNode = cand;
-        final worker = await _ensureAbWorker();
-        abFuture = worker.rollout(
-            [abNode.fen], [_abMaxDepth], _nnLatencyMs.round().clamp(5, 1000));
-      }
-    }
-    final results = await nnFuture;
-    sw.stop();
-    _nnLatencyMs = 0.8 * _nnLatencyMs + 0.2 * sw.elapsedMicroseconds / 1000.0;
     for (var i = 0; i < leaves.length; i++) {
       values[leaves[i]] = _applyExpandResult(leaves[i], results[i]);
-    }
-    if (abFuture != null && abNode != null) {
-      final infos = await abFuture;
-      if (infos.isNotEmpty) {
-        final inj = abInjection(infos.first);
-        if (inj != null) {
-          abNode.abValue = inj.value;
-          // Cap the prior by the node's own visit evidence so a shallow,
-          // latency-bounded search can inform but never overwhelm the net
-          // (keeps the weight balanced across fast and slow nets).
-          abNode.abWeight = math.min(inj.weight, math.max(1, abNode.visits));
-        }
-      }
     }
     for (final path in paths) {
       _backup(path, values[path.last] ?? path.last.terminalValue);
     }
-  }
-
-  /// Returns the rollout AB worker, spawning it once on first use.
-  Future<AbWorker> _ensureAbWorker() {
-    final w = _abWorker;
-    if (w != null) return Future.value(w);
-    return _abWorkerStarting ??= AbWorker.start().then((worker) {
-      _abWorker = worker;
-      return worker;
-    });
   }
 
   /// Attaches children (or marks terminal) from a worker [ExpandResult] and
