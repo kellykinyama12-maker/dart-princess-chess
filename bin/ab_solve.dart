@@ -7,12 +7,14 @@ import 'dart:io';
 
 import 'package:chess/chess.dart' as ch;
 import 'package:chess_moves/alphabeta.dart';
+import 'package:chess_moves/lc0_evaluator.dart';
 import 'package:chess_moves/nnue.dart';
 
 void main(List<String> args) {
   var movetime = 2000;
   var maxDepth = 64;
   String? nnuePath;
+  String? orderNet;
   var complexity = false;
   var cxVerbose = false;
   final files = <String>[];
@@ -24,6 +26,8 @@ void main(List<String> args) {
         maxDepth = int.parse(args[++i]);
       case '--nnue':
         nnuePath = args[++i];
+      case '--ordernet':
+        orderNet = args[++i];
       case '--complexity':
         complexity = true;
       case '--cxverbose':
@@ -38,6 +42,7 @@ void main(List<String> args) {
       nnue: nnuePath != null ? Nnue.load(nnuePath) : null,
       complexity: complexity);
   ab.cxVerbose = cxVerbose;
+  final orderer = orderNet != null ? Lc0Evaluator.load(orderNet) : null;
   var solved = 0, total = 0, totalMs = 0, totalNodes = 0;
   for (final f in files) {
     if (!File(f).existsSync()) {
@@ -66,8 +71,16 @@ void main(List<String> args) {
       total++;
 
       final sw = Stopwatch()..start();
-      final r = ab.search(p.fen, maxDepth: maxDepth,
-          time: Duration(milliseconds: movetime));
+      final priors = orderer != null
+          ? orderer
+              .evaluate(p.fen, board.turn == ch.Chess.WHITE ? 0 : 1,
+                  uciToSan.keys.toList())
+              .priors
+          : null;
+      final r = ab.search(p.fen,
+          maxDepth: maxDepth,
+          time: Duration(milliseconds: movetime),
+          rootPriors: priors);
       sw.stop();
       totalMs += sw.elapsedMilliseconds;
       totalNodes += r.nodes;
