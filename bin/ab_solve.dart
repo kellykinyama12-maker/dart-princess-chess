@@ -7,10 +7,12 @@ import 'dart:io';
 
 import 'package:chess/chess.dart' as ch;
 import 'package:chess_moves/alphabeta.dart';
+import 'package:chess_moves/nnue.dart';
 
 void main(List<String> args) {
   var movetime = 2000;
   var maxDepth = 64;
+  String? nnuePath;
   final files = <String>[];
   for (var i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -18,13 +20,15 @@ void main(List<String> args) {
         movetime = int.parse(args[++i]);
       case '--depth':
         maxDepth = int.parse(args[++i]);
+      case '--nnue':
+        nnuePath = args[++i];
       default:
         files.add(args[i]);
     }
   }
   if (files.isEmpty) files.add('test/tactics.epd');
 
-  final ab = AlphaBeta();
+  final ab = AlphaBeta(nnue: nnuePath != null ? Nnue.load(nnuePath) : null);
   var solved = 0, total = 0, totalMs = 0, totalNodes = 0;
   for (final f in files) {
     if (!File(f).existsSync()) {

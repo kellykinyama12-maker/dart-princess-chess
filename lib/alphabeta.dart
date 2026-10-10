@@ -2,6 +2,8 @@ import 'dart:math' as math;
 
 import 'package:chess/chess.dart' as ch;
 
+import 'nnue.dart';
+
 /// Result of an alpha-beta search of one position.
 class AbResult {
   final String? bestUci; // best move (absolute UCI), null if none
@@ -45,7 +47,13 @@ class AlphaBeta {
   DateTime? _deadline;
   bool _aborted = false;
 
-  AlphaBeta({Map<int, _Tt>? sharedTt, int seed = 0x9e3779b9})
+  // Optional NNUE evaluator; when set it replaces the material+PST eval. Its
+  // output (~3x classical centipawns) is scaled down to keep mate/thresholds
+  // calibrated.
+  final Nnue? nnue;
+  static const int _nnueScale = 3;
+
+  AlphaBeta({Map<int, _Tt>? sharedTt, int seed = 0x9e3779b9, this.nnue})
       : tt = sharedTt ?? <int, _Tt>{},
         _zPiece = List<int>.filled(12 * 64, 0),
         _zCastle = List<int>.filled(4, 0),
@@ -336,8 +344,11 @@ class AlphaBeta {
     return alpha;
   }
 
-  /// Evaluation (material + piece-square tables) from side-to-move POV.
+  /// Evaluation from side-to-move POV. Uses NNUE when available, else a
+  /// material + piece-square-table estimate.
   int _evalStm() {
+    final nn = nnue;
+    if (nn != null) return nn.evaluate(_b) ~/ _nnueScale;
     var white = 0;
     for (var i = ch.Chess.SQUARES_A8; i <= ch.Chess.SQUARES_H1; i++) {
       if ((i & 0x88) != 0) {
