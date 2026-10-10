@@ -7,26 +7,39 @@ import 'board_expand.dart';
 import 'eval_pool.dart';
 import 'lc0_evaluator.dart';
 
+/// Per-position statistics, shared across all tree nodes that transpose to the
+/// same Zobrist key (the transposition table).
+class _Stats {
+  int visits = 0;
+  double valueSum = 0.0;
+  int vloss = 0; // pending virtual losses while a playout is in flight
+}
+
 /// A single MCTS tree node. Values are stored from the perspective of the side
-/// to move *at this node* (negamax convention).
+/// to move *at this node* (negamax convention). Visit/value stats live in a
+/// shared [_Stats] so transposing nodes pool their search knowledge.
 class _Node {
   final String fen;
   final int stm; // side to move: 0 = White, 1 = Black
   final int key; // Zobrist hash, maintained incrementally
+  final _Stats _s;
   double prior; // mutable so root exploration noise can be mixed in
-
-  int visits = 0;
-  double valueSum = 0.0;
 
   Map<String, _Node>? children; // null until expanded; {} for terminal nodes
   bool terminal = false;
   double terminalValue = 0.0;
   bool noiseApplied = false; // guards one-time Dirichlet noise per search root
-  int vloss = 0; // pending virtual losses while a playout is in flight
 
-  _Node(this.fen, this.stm, this.prior, this.key);
+  _Node(this.fen, this.stm, this.prior, this.key, this._s);
 
-  double get q => visits == 0 ? 0.0 : valueSum / visits;
+  int get visits => _s.visits;
+  set visits(int v) => _s.visits = v;
+  double get valueSum => _s.valueSum;
+  set valueSum(double v) => _s.valueSum = v;
+  int get vloss => _s.vloss;
+  set vloss(int v) => _s.vloss = v;
+
+  double get q => _s.visits == 0 ? 0.0 : _s.valueSum / _s.visits;
 }
 
 /// Result row for one root move after a search.
@@ -50,9 +63,11 @@ class Mcts {
   final double dirichletEpsilon;
   final double fpuReduction; // penalty applied to unvisited children (FPU)
   final int batchSize; // >1 collects a batch of distinct leaves via virtual loss
+  final bool transpositions; // share stats across nodes with the same Zobrist key
   final math.Random _rng;
 
   _Node? _root; // persisted across searches to enable tree reuse
+  final Map<int, _Stats> _tt = {}; // Zobrist key -> shared stats
   bool _stopFlag = false; // set by stop() to end a search budget early
 
   Mcts(
@@ -63,6 +78,7 @@ class Mcts {
     this.dirichletEpsilon = 0.25,
     this.fpuReduction = 0.2,
     this.batchSize = 1,
+    this.transpositions = true,
     int? seed,
   })  : pool = null,
         _rng = math.Random(seed);
@@ -77,9 +93,15 @@ class Mcts {
     this.dirichletEpsilon = 0.25,
     this.fpuReduction = 0.2,
     this.batchSize = 8,
+    this.transpositions = true,
     int? seed,
   })  : eval = null,
         _rng = math.Random(seed);
+
+  /// Creates a node whose stats come from the transposition table (shared by
+  /// Zobrist key) when [transpositions] is on, else a fresh per-node stat.
+  _Node _mkNode(String fen, int stm, double prior, int key) => _Node(fen, stm,
+      prior, key, transpositions ? _tt.putIfAbsent(key, _Stats.new) : _Stats());
 
   /// Visit count accumulated at the current persistent root (0 if none).
   int get rootVisits => _root?.visits ?? 0;
@@ -127,7 +149,10 @@ class Mcts {
   }
 
   /// Drops the persistent tree (call when starting an unrelated position).
-  void reset() => _root = null;
+  void reset() {
+    _root = null;
+    _tt.clear();
+  }
 
   /// Advances the persistent tree to the child reached by [uci] so the next
   /// [search] reuses its subtree. Returns false (and clears the tree) if no
@@ -174,7 +199,7 @@ class Mcts {
     final reuse = _root != null && _root!.fen == rootFen;
     final root = reuse
         ? _root!
-        : _Node(rootFen, _stm(rootFen), 1.0, boardZobrist.ofFen(rootFen));
+        : _mkNode(rootFen, _stm(rootFen), 1.0, boardZobrist.ofFen(rootFen));
     _root = root;
     // Expand the root first so exploration noise can be seeded on its children.
     if (root.children == null) {
@@ -252,7 +277,7 @@ class Mcts {
     final reuse = _root != null && _root!.fen == rootFen;
     final root = reuse
         ? _root!
-        : _Node(rootFen, _stm(rootFen), 1.0, boardZobrist.ofFen(rootFen));
+        : _mkNode(rootFen, _stm(rootFen), 1.0, boardZobrist.ofFen(rootFen));
     _root = root;
 
     if (root.children == null) {
@@ -309,7 +334,7 @@ class Mcts {
     node.children = <String, _Node>{};
     for (var i = 0; i < r.legal.length; i++) {
       node.children![r.legal[i]] =
-          _Node(r.childFens[i], 1 - node.stm, r.priors[i], r.childKeys[i]);
+          _mkNode(r.childFens[i], 1 - node.stm, r.priors[i], r.childKeys[i]);
     }
     return r.value;
   }
@@ -502,7 +527,7 @@ class Mcts {
   double _applyExpansion(_Node node, _Prep prep, Evaluation e) {
     node.children = <String, _Node>{};
     for (final uci in prep.legal) {
-      node.children![uci] = _Node(
+      node.children![uci] = _mkNode(
           prep.childFen[uci]!, 1 - node.stm, e.priors[uci] ?? 0.0,
           prep.childKey[uci]!);
     }

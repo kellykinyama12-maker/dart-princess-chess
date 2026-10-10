@@ -42,6 +42,7 @@ class _Engine {
   double cpuct = 1.5;
   bool ponderEnabled = false;
   bool useAb = true; // run the alpha-beta tactical worker alongside MCTS
+  bool useTT = true; // share MCTS stats across transposing positions
   String weightsPath = _resolveWeights();
 
   EvalPool? _pool;
@@ -70,6 +71,7 @@ class _Engine {
         _out('option name Cpuct type string default 1.5');
         _out('option name Ponder type check default false');
         _out('option name UseAB type check default true');
+        _out('option name UseTT type check default true');
         _out('option name WeightsFile type string default $weightsPath');
         _out('uciok');
       case 'isready':
@@ -126,6 +128,12 @@ class _Engine {
           useAb = v;
           _disposeEngine();
         }
+      case 'usett':
+        final v = value.toLowerCase() == 'true';
+        if (v != useTT) {
+          useTT = v;
+          _disposeEngine();
+        }
       case 'weightsfile':
         if (value.isNotEmpty && value != weightsPath) {
           weightsPath = value;
@@ -142,11 +150,12 @@ class _Engine {
     }
     if (threads > 1) {
       _pool = await EvalPool.start(weightsPath, threads);
-      _mcts = Mcts.pooled(_pool!, cPuct: cpuct, batchSize: threads * 2);
+      _mcts = Mcts.pooled(_pool!,
+          cPuct: cpuct, batchSize: threads * 2, transpositions: useTT);
       if (useAb) _ab = await AbWorker.start();
     } else {
       final evaluator = Lc0Evaluator.load(weightsPath);
-      _mcts = Mcts(evaluator, cPuct: cpuct);
+      _mcts = Mcts(evaluator, cPuct: cpuct, transpositions: useTT);
     }
   }
 
