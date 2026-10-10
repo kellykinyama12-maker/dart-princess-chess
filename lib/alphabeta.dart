@@ -53,7 +53,18 @@ class AlphaBeta {
   final Nnue? nnue;
   static const int _nnueScale = 3;
 
-  AlphaBeta({Map<int, _Tt>? sharedTt, int seed = 0x9e3779b9, this.nnue})
+  // Complexity-budget search: "depth" is the number of quiet moves in a line;
+  // forcing moves (checks, replies to check, captures, promotions, castling)
+  // cost 0 and extend for free, bounded only by [_maxPly].
+  final bool complexity;
+  static const int _maxPly = 64;
+  int _plyCap = _maxPly; // forcing-extension depth cap for the current budget
+
+  AlphaBeta(
+      {Map<int, _Tt>? sharedTt,
+      int seed = 0x9e3779b9,
+      this.nnue,
+      this.complexity = false})
       : tt = sharedTt ?? <int, _Tt>{},
         _zPiece = List<int>.filled(12 * 64, 0),
         _zCastle = List<int>.filled(4, 0),
@@ -83,6 +94,7 @@ class AlphaBeta {
     _b.load(fen, check_validity: false);
     _deadline = time == null ? null : DateTime.now().add(time);
     _nodes = 0;
+    if (complexity) return _searchComplexity(maxDepth, rootPriors);
 
     ch.Move? bestMove;
     var bestScore = 0;
@@ -289,6 +301,130 @@ class AlphaBeta {
 
     final flag = best <= origAlpha ? 2 : (best >= beta ? 1 : 0);
     _store(key, depth, best, flag, bestMove);
+    return best;
+  }
+
+  /// Iterative-deepening over a complexity budget (number of quiet moves in a
+  /// line); forcing moves cost 0. The reported depth is the budget reached.
+  AbResult _searchComplexity(int maxBudget, Map<String, double>? rootPriors) {
+    ch.Move? bestMove;
+    var bestScore = 0;
+    var reached = 0;
+    for (var budget = 1; budget <= maxBudget; budget++) {
+      _aborted = false;
+      // Bound forcing extensions relative to the budget so each iteration
+      // terminates; the cap grows as iterative deepening proceeds.
+      _plyCap = budget + 12;
+      final rootMoves = _b.generate_moves();
+      if (rootMoves.isEmpty) break;
+      _order(rootMoves, bestMove, rootPriors);
+      final inCheck = _b.king_attacked(_b.turn);
+      var alpha = -_inf;
+      const beta = _inf;
+      var localBest = -_inf;
+      ch.Move? localBestMove;
+      for (final m in rootMoves) {
+        _b.make_move(m);
+        final cost =
+            (inCheck || _isForcing(m, _b.king_attacked(_b.turn))) ? 0 : 1;
+        final score = -_negamaxC(budget - cost, -beta, -alpha, 1);
+        _b.undo_move();
+        if (_aborted) break;
+        if (score > localBest) {
+          localBest = score;
+          localBestMove = m;
+        }
+        if (score > alpha) alpha = score;
+      }
+      if (_aborted) break;
+      bestScore = localBest;
+      bestMove = localBestMove;
+      reached = budget;
+      _store(_zobrist(), budget, bestScore, 0, bestMove);
+      if (bestScore.abs() >= mateScore - 1000) break;
+    }
+    return AbResult(bestMove == null ? null : _uci(bestMove), bestScore,
+        reached, _extractPv(16), _nodes);
+  }
+
+  /// A move is forcing (complexity 0) if it is a capture, promotion or castle,
+  /// or gives check ([givesCheck] = opponent in check after the move).
+  bool _isForcing(ch.Move m, bool givesCheck) =>
+      givesCheck ||
+      (m.flags &
+              (ch.Chess.BITS_CAPTURE |
+                  ch.Chess.BITS_EP_CAPTURE |
+                  ch.Chess.BITS_PROMOTION |
+                  ch.Chess.BITS_KSIDE_CASTLE |
+                  ch.Chess.BITS_QSIDE_CASTLE)) !=
+          0;
+
+  /// Negamax on a complexity budget. Quiet moves cost 1, forcing moves cost 0
+  /// and extend for free. At budget <= 0 (and not in check) the node is a
+  /// quiescence leaf: stand-pat, then search only forcing moves.
+  int _negamaxC(int budget, int alpha, int beta, int ply) {
+    if ((_nodes & 2047) == 0 && _timeUp()) {
+      _aborted = true;
+      return 0;
+    }
+    _nodes++;
+    if (ply >= _plyCap) return _evalStm();
+
+    final key = _zobrist();
+    final tte = tt[key];
+    ch.Move? ttMove;
+    if (tte != null) {
+      if (tte.depth >= budget) {
+        if (tte.flag == 0) return tte.score;
+        if (tte.flag == 1 && tte.score >= beta) return tte.score;
+        if (tte.flag == 2 && tte.score <= alpha) return tte.score;
+      }
+      ttMove = _moveFromSquares(tte.from, tte.to);
+    }
+
+    final inCheck = _b.king_attacked(_b.turn);
+    final moves = _b.generate_moves();
+    if (moves.isEmpty) {
+      return inCheck ? -(mateScore - ply) : 0;
+    }
+
+    final atLeaf = budget <= 0 && !inCheck;
+    final origAlpha = alpha;
+    var best = -_inf;
+    if (atLeaf) {
+      final standPat = _evalStm();
+      if (standPat >= beta) return beta;
+      best = standPat;
+      if (standPat > alpha) alpha = standPat;
+    }
+
+    _order(moves, ttMove);
+    ch.Move? bestMove;
+    const tacticalMask = ch.Chess.BITS_CAPTURE |
+        ch.Chess.BITS_EP_CAPTURE |
+        ch.Chess.BITS_PROMOTION |
+        ch.Chess.BITS_KSIDE_CASTLE |
+        ch.Chess.BITS_QSIDE_CASTLE;
+    for (final m in moves) {
+      // Quiescence (budget exhausted): only captures/promotions, which
+      // self-limit as material runs out; quiet checks would chain unboundedly.
+      if (atLeaf && (m.flags & tacticalMask) == 0) continue;
+      _b.make_move(m);
+      final forcing = inCheck || _isForcing(m, _b.king_attacked(_b.turn));
+      final score =
+          -_negamaxC(budget - (forcing ? 0 : 1), -beta, -alpha, ply + 1);
+      _b.undo_move();
+      if (_aborted) return 0;
+      if (score > best) {
+        best = score;
+        bestMove = m;
+      }
+      if (score > alpha) alpha = score;
+      if (alpha >= beta) break;
+    }
+
+    final flag = best <= origAlpha ? 2 : (best >= beta ? 1 : 0);
+    _store(key, budget, best, flag, bestMove);
     return best;
   }
 

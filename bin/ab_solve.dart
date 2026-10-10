@@ -13,6 +13,7 @@ void main(List<String> args) {
   var movetime = 2000;
   var maxDepth = 64;
   String? nnuePath;
+  var complexity = false;
   final files = <String>[];
   for (var i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -22,13 +23,17 @@ void main(List<String> args) {
         maxDepth = int.parse(args[++i]);
       case '--nnue':
         nnuePath = args[++i];
+      case '--complexity':
+        complexity = true;
       default:
         files.add(args[i]);
     }
   }
   if (files.isEmpty) files.add('test/tactics.epd');
 
-  final ab = AlphaBeta(nnue: nnuePath != null ? Nnue.load(nnuePath) : null);
+  final ab = AlphaBeta(
+      nnue: nnuePath != null ? Nnue.load(nnuePath) : null,
+      complexity: complexity);
   var solved = 0, total = 0, totalMs = 0, totalNodes = 0;
   for (final f in files) {
     if (!File(f).existsSync()) {
