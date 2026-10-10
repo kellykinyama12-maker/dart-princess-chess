@@ -13,6 +13,10 @@ class _Stats {
   int visits = 0;
   double valueSum = 0.0;
   int vloss = 0; // pending virtual losses while a playout is in flight
+  // Alpha-beta value prior (position STM POV) injected via the TT, weighted
+  // like [abWeight] extra visits — stat transfer from the AB worker.
+  double abValue = 0.0;
+  int abWeight = 0;
 }
 
 /// A single MCTS tree node. Values are stored from the perspective of the side
@@ -38,8 +42,15 @@ class _Node {
   set valueSum(double v) => _s.valueSum = v;
   int get vloss => _s.vloss;
   set vloss(int v) => _s.vloss = v;
+  int get abWeight => _s.abWeight;
+  double get abValue => _s.abValue;
 
-  double get q => _s.visits == 0 ? 0.0 : _s.valueSum / _s.visits;
+  /// Value estimate blending MCTS visits with the AB value prior.
+  double get q {
+    final n = _s.visits + _s.abWeight;
+    if (n == 0) return 0.0;
+    return (_s.valueSum + _s.abWeight * _s.abValue) / n;
+  }
 }
 
 /// Result row for one root move after a search.
@@ -152,6 +163,17 @@ class Mcts {
   void reset() {
     _root = null;
     _tt.clear();
+  }
+
+  /// Stat transfer from alpha-beta: records [value] (position side-to-move POV,
+  /// in [-1,1]) for [fen] in the transposition table, weighted like [weight]
+  /// visits. Mates use a dominant weight; scores a modest one. No-op when the
+  /// transposition table is off.
+  void injectAb(String fen, double value, int weight) {
+    if (!transpositions) return;
+    final s = _tt.putIfAbsent(boardZobrist.ofFen(fen), _Stats.new);
+    s.abValue = value;
+    s.abWeight = weight;
   }
 
   /// Advances the persistent tree to the child reached by [uci] so the next
@@ -414,8 +436,8 @@ class Mcts {
     _Node? best;
     var bestScore = double.negativeInfinity;
     node.children!.forEach((_, child) {
-      final exploit =
-          child.visits > 0 ? -child.q : (parentQ - fpuReduction);
+      final known = child.visits > 0 || child.abWeight > 0;
+      final exploit = known ? -child.q : (parentQ - fpuReduction);
       final explore =
           cPuct * child.prior * math.sqrt(parentVisits + 1) / (1 + child.visits);
       final score = exploit + explore;
@@ -466,9 +488,14 @@ class Mcts {
       var bestScore = double.negativeInfinity;
       node.children!.forEach((_, child) {
         final cv = child.visits + child.vloss;
-        // child.vloss adds a pending win for the child (= loss for this parent).
-        final effQ = cv > 0 ? (child.valueSum + child.vloss) / cv : 0.0;
-        final exploit = cv > 0 ? -effQ : (parentQ - fpuReduction);
+        final abW = child.abWeight;
+        final denom = cv + abW;
+        // child.vloss adds a pending win for the child (= loss for this parent);
+        // the AB prior adds abW virtual visits at child.abValue.
+        final effQ = denom > 0
+            ? (child.valueSum + child.vloss + abW * child.abValue) / denom
+            : 0.0;
+        final exploit = denom > 0 ? -effQ : (parentQ - fpuReduction);
         final explore =
             cPuct * child.prior * math.sqrt(parentVisits + 1) / (1 + cv);
         final score = exploit + explore;

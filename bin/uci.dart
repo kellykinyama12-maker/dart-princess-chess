@@ -289,6 +289,10 @@ class _Engine {
           final infos = await _ab!.focus(focus, priors, 150);
           for (final info in infos) {
             abByFen[info.fen] = info;
+            final inj = abInjection(info);
+            if (inj != null) {
+              _mcts!.injectAb(info.fen, inj.value, inj.weight);
+            }
           }
         }
       }

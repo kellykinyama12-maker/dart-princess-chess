@@ -1,8 +1,34 @@
 import 'dart:async';
 import 'dart:isolate';
+import 'dart:math' as math;
 
 import 'mcts.dart' show MoveStat;
 import 'alphabeta.dart';
+
+/// AB value (position side-to-move POV) and weight to transfer into the MCTS
+/// transposition table, or null to leave a quiet position to the net.
+class AbInject {
+  final double value; // in [-1, 1]
+  final int weight; // like this many MCTS visits
+  AbInject(this.value, this.weight);
+}
+
+/// Maps an [AbInfo] to a stat-transfer contribution: mates dominate; decisive
+/// scores get a modest weight; quiet positions are skipped (net decides).
+AbInject? abInjection(AbInfo info) {
+  if (info.mate) {
+    return AbInject(info.scoreCp > 0 ? 1.0 : -1.0, 1 << 16);
+  }
+  if (info.scoreCp.abs() < 150) return null;
+  final x = info.scoreCp / 400.0;
+  final v = x > 20
+      ? 1.0
+      : x < -20
+          ? -1.0
+          : (math.exp(2 * x) - 1) / (math.exp(2 * x) + 1); // tanh
+  final w = (info.depth * 2).clamp(4, 40);
+  return AbInject(v, w);
+}
 
 /// Alpha-beta result for one position, as streamed back from the worker.
 class AbInfo {

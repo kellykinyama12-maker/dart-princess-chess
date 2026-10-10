@@ -127,6 +127,10 @@ Future<void> main(List<String> args) async {
           final infos = await ab.focus(focus, priors, 250);
           for (final info in infos) {
             abByFen[info.fen] = info;
+            final inj = abInjection(info);
+            if (inj != null) {
+              mcts.injectAb(info.fen, inj.value, inj.weight);
+            }
           }
         }
       }
