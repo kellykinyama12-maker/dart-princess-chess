@@ -86,51 +86,37 @@ class AlphaBeta {
       if (rootMoves.isEmpty) break;
       _order(rootMoves, bestMove, rootPriors);
 
+      // Aspiration window: search a narrow band around the previous score and
+      // widen on a fail-high/low, falling back to a full window.
       var alpha = -_inf;
-      const beta = _inf;
-      var localBest = -_inf;
-      ch.Move? localBestMove;
-      final inCheck = _b.king_attacked(_b.turn);
-      var moveCount = 0;
-      for (final m in rootMoves) {
-        final isQuiet = (m.flags &
-                (ch.Chess.BITS_CAPTURE |
-                    ch.Chess.BITS_EP_CAPTURE |
-                    ch.Chess.BITS_PROMOTION)) ==
-            0;
-        final liked = _netLikes(m, rootPriors); // never reduce a move MCTS likes
-        _b.make_move(m);
-        final givesCheck = _b.king_attacked(_b.turn);
-        int score;
-        if (moveCount == 0) {
-          score = -_negamax(depth - 1, -beta, -alpha, 1);
-        } else {
-          var r = 0;
-          if (depth >= 3 &&
-              moveCount >= 4 &&
-              isQuiet &&
-              !liked &&
-              !inCheck &&
-              !givesCheck) {
-            r = 1;
-          }
-          score = -_negamax(depth - 1 - r, -alpha - 1, -alpha, 1);
-          if (!_aborted && score > alpha) {
-            score = -_negamax(depth - 1, -beta, -alpha, 1);
-          }
-        }
-        _b.undo_move();
+      var beta = _inf;
+      var delta = 30;
+      if (depth >= 4) {
+        alpha = bestScore - delta;
+        beta = bestScore + delta;
+      }
+      while (true) {
+        final (score, move) =
+            _searchRoot(depth, alpha, beta, rootMoves, rootPriors);
         if (_aborted) break;
-        moveCount++;
-        if (score > localBest) {
-          localBest = score;
-          localBestMove = m;
+        if (score <= alpha) {
+          delta *= 2;
+          alpha = bestScore - delta <= -(mateScore - 1000)
+              ? -_inf
+              : bestScore - delta;
+        } else if (score >= beta) {
+          delta *= 2;
+          beta = bestScore + delta >= mateScore - 1000
+              ? _inf
+              : bestScore + delta;
+          if (move != null) bestMove = move;
+        } else {
+          bestScore = score;
+          if (move != null) bestMove = move;
+          break;
         }
-        if (score > alpha) alpha = score;
       }
       if (_aborted) break; // discard the half-finished depth
-      bestScore = localBest;
-      bestMove = localBestMove;
       reached = depth;
       _store(_zobrist(), depth, bestScore, 0, bestMove);
       if (bestScore.abs() >= mateScore - 1000) break;
@@ -139,6 +125,55 @@ class AlphaBeta {
     return AbResult(
         bestMove == null ? null : _uci(bestMove), bestScore, reached,
         _extractPv(16), _nodes);
+  }
+
+  /// Searches all root moves within [alpha]..[beta] and returns the best score
+  /// and move. Applies the net-like-protected LMR; a fail-high (alpha >= beta)
+  /// stops early so the aspiration loop can widen.
+  (int, ch.Move?) _searchRoot(int depth, int alpha, int beta,
+      List<ch.Move> rootMoves, Map<String, double>? priors) {
+    var localBest = -_inf;
+    ch.Move? localBestMove;
+    final inCheck = _b.king_attacked(_b.turn);
+    var moveCount = 0;
+    for (final m in rootMoves) {
+      final isQuiet = (m.flags &
+              (ch.Chess.BITS_CAPTURE |
+                  ch.Chess.BITS_EP_CAPTURE |
+                  ch.Chess.BITS_PROMOTION)) ==
+          0;
+      final liked = _netLikes(m, priors); // never reduce a move MCTS likes
+      _b.make_move(m);
+      final givesCheck = _b.king_attacked(_b.turn);
+      int score;
+      if (moveCount == 0) {
+        score = -_negamax(depth - 1, -beta, -alpha, 1);
+      } else {
+        var r = 0;
+        if (depth >= 3 &&
+            moveCount >= 4 &&
+            isQuiet &&
+            !liked &&
+            !inCheck &&
+            !givesCheck) {
+          r = 1;
+        }
+        score = -_negamax(depth - 1 - r, -alpha - 1, -alpha, 1);
+        if (!_aborted && score > alpha) {
+          score = -_negamax(depth - 1, -beta, -alpha, 1);
+        }
+      }
+      _b.undo_move();
+      if (_aborted) break;
+      moveCount++;
+      if (score > localBest) {
+        localBest = score;
+        localBestMove = m;
+      }
+      if (score > alpha) alpha = score;
+      if (alpha >= beta) break; // fail-high beyond the aspiration window
+    }
+    return (localBest, localBestMove);
   }
 
   int _negamax(int depth, int alpha, int beta, int ply) {
@@ -194,6 +229,11 @@ class AlphaBeta {
     var best = -_inf;
     ch.Move? bestMove;
     var moveCount = 0;
+    // Futility pruning: at frontier nodes, quiet moves that can't lift a
+    // generous static eval to alpha are skipped.
+    final canFutility =
+        depth <= 2 && !inCheck && alpha.abs() < mateScore - 1000;
+    final futilityBase = canFutility ? _evalStm() : 0;
     for (final m in moves) {
       final isQuiet = (m.flags &
               (ch.Chess.BITS_CAPTURE |
@@ -202,6 +242,14 @@ class AlphaBeta {
           0;
       _b.make_move(m);
       final givesCheck = _b.king_attacked(_b.turn);
+      if (canFutility &&
+          moveCount > 0 &&
+          isQuiet &&
+          !givesCheck &&
+          futilityBase + depth * 150 <= alpha) {
+        _b.undo_move();
+        continue;
+      }
       int score;
       if (moveCount == 0) {
         score = -_negamax(depth - 1, -beta, -alpha, ply + 1);
