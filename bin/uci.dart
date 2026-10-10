@@ -79,6 +79,7 @@ class _Engine {
         _setOption(tok);
       case 'ucinewgame':
         _mcts?.reset();
+        _pool?.clearCache();
       case 'position':
         _position(tok);
       case 'go':
@@ -320,6 +321,7 @@ class _Engine {
     final cp = _toCentipawns(-best.q); // side-to-move POV
     _out('info depth ${pv.length} nodes ${_mcts!.rootVisits} nps $nps '
         'score cp $cp time $ms pv ${pv.join(' ')}');
+    if (_pool != null) _out('info string ${_pool!.cacheStats()}');
 
     // Tactical override: let alpha-beta correct the MCTS move when it sees a
     // concrete gap (mate / material), else keep the net's choice.
