@@ -668,6 +668,17 @@ class AlphaBeta {
     moves.sort((a, b) => score(b).compareTo(score(a)));
   }
 
+  /// Populates interior move-ordering policy from MCTS `{fen: {uci: prior}}`,
+  /// re-keyed to this searcher's own zobrist. Clobbers the working board (the
+  /// next search reloads it).
+  void setNodePriors(Map<String, Map<String, double>> fenPriors) {
+    nodePriors.clear();
+    for (final e in fenPriors.entries) {
+      _b.load(e.key, check_validity: false);
+      nodePriors[_zobrist()] = e.value;
+    }
+  }
+
   /// Probes the net policy on the first [_pvProbeLen] PV positions and caches it
   /// by zobrist key, so subsequent iterations order those interior nodes by net
   /// policy. No-op when [policyProbe] is unset.

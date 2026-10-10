@@ -79,11 +79,12 @@ class AbWorker {
   /// gives each position's net policy (move UCI -> prior) for root move
   /// ordering, or null to fall back to MVV-LVA. Successive calls reuse the TT.
   Future<List<AbInfo>> focus(
-      List<String> fens, List<Map<String, double>?> priors, int budgetMs) {
+      List<String> fens, List<Map<String, double>?> priors, int budgetMs,
+      {Map<String, Map<String, double>>? nodePriors}) {
     final id = _nextId++;
     final c = Completer<List<AbInfo>>();
     _pending[id] = c;
-    _send.send([id, fens, priors, budgetMs, _recv.sendPort]);
+    _send.send([id, fens, priors, budgetMs, _recv.sendPort, nodePriors]);
     return c.future;
   }
 
@@ -111,6 +112,11 @@ void _abMain(List args) {
     final priors = (list[2] as List).cast<Map<String, double>?>();
     final budgetMs = list[3] as int;
     final reply = list[4] as SendPort;
+    // Interior move-ordering policy shared from MCTS (fen -> net priors).
+    final nodePriors = list.length > 5
+        ? list[5] as Map<String, Map<String, double>>?
+        : null;
+    if (nodePriors != null) ab.setNodePriors(nodePriors);
 
     // Root gets a double share; the rest split the remainder.
     final rows = <List>[];

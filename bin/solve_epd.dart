@@ -24,6 +24,7 @@ Future<void> main(List<String> args) async {
   var useAb = false;
   var abCx = false; // use the complexity-budget AB search in the worker
   var abPv = false; // expand the AB principal variation into the MCTS tree
+  var abShare = false; // share MCTS net priors into AB interior move ordering
   String? net;
   final files = <String>[];
   for (var i = 0; i < args.length; i++) {
@@ -42,6 +43,8 @@ Future<void> main(List<String> args) async {
         abCx = true;
       case '--abpv':
         abPv = true;
+      case '--abshare':
+        abShare = true;
       case '--net':
         net = args[++i];
       default:
@@ -130,7 +133,8 @@ Future<void> main(List<String> args) async {
           final focus = <String>[p.fen, ...mcts.topRootChildFens(2)];
           final pri = mcts.focusPriors(2);
           final priors = [for (final f in focus) pri[f]];
-          final infos = await ab.focus(focus, priors, 250);
+          final infos = await ab.focus(focus, priors, 250,
+              nodePriors: abShare ? mcts.expandedPriors() : null);
           for (final info in infos) {
             abByFen[info.fen] = info;
             final inj = abInjection(info);

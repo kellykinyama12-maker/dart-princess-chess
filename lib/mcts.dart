@@ -159,6 +159,32 @@ class Mcts {
     return out;
   }
 
+  /// Net policy for the expanded nodes nearest the root `{fen: {moveUci:
+  /// prior}}`, most-visited first up to [max], to share with the AB searcher's
+  /// interior move ordering.
+  Map<String, Map<String, double>> expandedPriors({int max = 128}) {
+    final out = <String, Map<String, double>>{};
+    final root = _root;
+    if (root == null) return out;
+    final expanded = <_Node>[];
+    final queue = <_Node>[root];
+    var qi = 0;
+    while (qi < queue.length) {
+      final n = queue[qi++];
+      final children = n.children;
+      if (children == null || children.isEmpty) continue;
+      expanded.add(n);
+      for (final c in children.values) {
+        if (c.children != null) queue.add(c);
+      }
+    }
+    expanded.sort((a, b) => b.visits.compareTo(a.visits));
+    for (final n in expanded.take(max)) {
+      out[n.fen] = {for (final e in n.children!.entries) e.key: e.value.prior};
+    }
+    return out;
+  }
+
   /// Drops the persistent tree (call when starting an unrelated position).
   void reset() {
     _root = null;

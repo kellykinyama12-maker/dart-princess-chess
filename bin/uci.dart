@@ -290,7 +290,8 @@ class _Engine {
           final focus = <String>[fen, ..._mcts!.topRootChildFens(2)];
           final pri = _mcts!.focusPriors(2);
           final priors = [for (final f in focus) pri[f]];
-          final infos = await _ab!.focus(focus, priors, 150);
+          final infos = await _ab!.focus(focus, priors, 150,
+              nodePriors: _mcts!.expandedPriors());
           for (final info in infos) {
             abByFen[info.fen] = info;
             final inj = abInjection(info);
