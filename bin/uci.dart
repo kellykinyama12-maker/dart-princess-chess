@@ -12,6 +12,7 @@ import 'dart:math' as math;
 
 import 'package:chess/chess.dart' as ch;
 
+import 'package:chess_moves/ab_worker.dart';
 import 'package:chess_moves/eval_pool.dart';
 import 'package:chess_moves/lc0_evaluator.dart';
 import 'package:chess_moves/mcts.dart';
@@ -40,9 +41,11 @@ class _Engine {
   int defaultNodes = 800;
   double cpuct = 1.5;
   bool ponderEnabled = false;
+  bool useAb = true; // run the alpha-beta tactical worker alongside MCTS
   String weightsPath = _resolveWeights();
 
   EvalPool? _pool;
+  AbWorker? _ab;
   Mcts? _mcts;
   ch.Chess _board = ch.Chess.fromFEN(_startFen);
 
@@ -66,6 +69,7 @@ class _Engine {
         _out('option name Nodes type spin default 800 min 1 max 100000000');
         _out('option name Cpuct type string default 1.5');
         _out('option name Ponder type check default false');
+        _out('option name UseAB type check default true');
         _out('option name WeightsFile type string default $weightsPath');
         _out('uciok');
       case 'isready':
@@ -115,6 +119,12 @@ class _Engine {
         }
       case 'ponder':
         ponderEnabled = value.toLowerCase() == 'true';
+      case 'useab':
+        final v = value.toLowerCase() == 'true';
+        if (v != useAb) {
+          useAb = v;
+          _disposeEngine();
+        }
       case 'weightsfile':
         if (value.isNotEmpty && value != weightsPath) {
           weightsPath = value;
@@ -132,6 +142,7 @@ class _Engine {
     if (threads > 1) {
       _pool = await EvalPool.start(weightsPath, threads);
       _mcts = Mcts.pooled(_pool!, cPuct: cpuct, batchSize: threads * 2);
+      if (useAb) _ab = await AbWorker.start();
     } else {
       final evaluator = Lc0Evaluator.load(weightsPath);
       _mcts = Mcts(evaluator, cPuct: cpuct);
@@ -141,6 +152,8 @@ class _Engine {
   void _disposeEngine() {
     _pool?.dispose();
     _pool = null;
+    _ab?.dispose();
+    _ab = null;
     _mcts = null;
   }
 
@@ -250,8 +263,30 @@ class _Engine {
   }
 
   Future<void> _runAsyncSearch(String fen, int? nodes) async {
+    final abByFen = <String, AbInfo>{};
     try {
-      _finishSearch(await _mcts!.searchBudgetAsync(fen, nodes: nodes));
+      var done = false;
+      final searchFut = _mcts!
+          .searchBudgetAsync(fen, nodes: nodes)
+          .whenComplete(() => done = true);
+      // Feed the root + MCTS best-move nodes (with their net priors) to the
+      // alpha-beta worker in parallel until the MCTS search finishes.
+      Future<void> feed() async {
+        while (!done && _ab != null) {
+          final focus = <String>[fen, ..._mcts!.topRootChildFens(2)];
+          final pri = _mcts!.focusPriors(2);
+          final priors = [for (final f in focus) pri[f]];
+          final infos = await _ab!.focus(focus, priors, 150);
+          for (final info in infos) {
+            abByFen[info.fen] = info;
+          }
+        }
+      }
+
+      final feedFut = _ab != null ? feed() : Future<void>.value();
+      final results = await searchFut;
+      await feedFut;
+      _finishSearch(results, abByFen);
     } catch (_) {
       // engine disposed mid-search (e.g. quit) — ignore
     }
@@ -267,7 +302,8 @@ class _Engine {
     }
   }
 
-  void _finishSearch(List<MoveStat> stats) {
+  void _finishSearch(List<MoveStat> stats,
+      [Map<String, AbInfo> abByFen = const {}]) {
     _timer?.cancel();
     _timer = null;
     _sw.stop();
@@ -284,9 +320,25 @@ class _Engine {
     final cp = _toCentipawns(-best.q); // side-to-move POV
     _out('info depth ${pv.length} nodes ${_mcts!.rootVisits} nps $nps '
         'score cp $cp time $ms pv ${pv.join(' ')}');
-    final ponderMove =
-        (ponderEnabled && pv.length >= 2) ? ' ponder ${pv[1]}' : '';
-    _out('bestmove ${best.uci}$ponderMove');
+
+    // Tactical override: let alpha-beta correct the MCTS move when it sees a
+    // concrete gap (mate / material), else keep the net's choice.
+    var chosen = best.uci;
+    if (_ab != null && abByFen.isNotEmpty && _mcts!.currentRootFen != null) {
+      chosen = combineRoot(
+        rootFen: _mcts!.currentRootFen!,
+        mctsStats: stats,
+        childFenByUci: _mcts!.rootChildFens(),
+        abByFen: abByFen,
+      );
+      if (chosen != best.uci) {
+        _out('info string ab override ${best.uci} -> $chosen');
+      }
+    }
+    final ponderMove = (ponderEnabled && chosen == best.uci && pv.length >= 2)
+        ? ' ponder ${pv[1]}'
+        : '';
+    _out('bestmove $chosen$ponderMove');
   }
 
   /// Time to spend this move in ms, or null for no time limit.

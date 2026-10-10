@@ -83,6 +83,48 @@ class Mcts {
   /// Visit count accumulated at the current persistent root (0 if none).
   int get rootVisits => _root?.visits ?? 0;
 
+  /// FEN at the current persistent root (null if no search has started).
+  String? get currentRootFen => _root?.fen;
+
+  /// FENs of the top-[k] root children by visit count (alpha-beta focus set).
+  List<String> topRootChildFens(int k) {
+    final children = _root?.children;
+    if (children == null) return const [];
+    final entries = children.entries.toList()
+      ..sort((a, b) => b.value.visits.compareTo(a.value.visits));
+    return [for (final e in entries.take(k)) e.value.fen];
+  }
+
+  /// Map of each root move (absolute UCI) to its resulting child FEN.
+  Map<String, String> rootChildFens() {
+    final children = _root?.children;
+    if (children == null) return const {};
+    return {for (final e in children.entries) e.key: e.value.fen};
+  }
+
+  /// Net policy priors `{fen: {moveUci: prior}}` for the root and its top-[k]
+  /// children, so the alpha-beta worker can order moves by the net's policy on
+  /// exactly the nodes the MCTS has already expanded.
+  Map<String, Map<String, double>> focusPriors(int k) {
+    final out = <String, Map<String, double>>{};
+    final root = _root;
+    final children = root?.children;
+    if (children == null) return out;
+    out[root!.fen] = {
+      for (final e in children.entries) e.key: e.value.prior
+    };
+    final top = children.entries.toList()
+      ..sort((a, b) => b.value.visits.compareTo(a.value.visits));
+    for (final e in top.take(k)) {
+      final c = e.value;
+      final gc = c.children;
+      if (gc != null && gc.isNotEmpty) {
+        out[c.fen] = {for (final g in gc.entries) g.key: g.value.prior};
+      }
+    }
+    return out;
+  }
+
   /// Drops the persistent tree (call when starting an unrelated position).
   void reset() => _root = null;
 

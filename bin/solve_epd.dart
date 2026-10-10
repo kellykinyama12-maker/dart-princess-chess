@@ -9,6 +9,7 @@ import 'dart:io';
 
 import 'package:chess/chess.dart' as ch;
 
+import 'package:chess_moves/ab_worker.dart';
 import 'package:chess_moves/eval_pool.dart';
 import 'package:chess_moves/lc0_evaluator.dart';
 import 'package:chess_moves/mcts.dart';
@@ -20,6 +21,7 @@ Future<void> main(List<String> args) async {
   int? nodes = 2000;
   int? movetime;
   var workers = 1;
+  var useAb = false;
   String? net;
   final files = <String>[];
   for (var i = 0; i < args.length; i++) {
@@ -32,6 +34,8 @@ Future<void> main(List<String> args) async {
         nodes = null;
       case '--workers':
         workers = int.parse(args[++i]);
+      case '--ab':
+        useAb = true;
       case '--net':
         net = args[++i];
       default:
@@ -71,11 +75,13 @@ Future<void> main(List<String> args) async {
     mcts = Mcts(Lc0Evaluator.load(weightsPath), addRootNoise: false);
   }
 
+  final ab = useAb ? await AbWorker.start() : null;
+
   final budget = movetime != null
       ? 'movetime ${movetime}ms'
       : 'nodes $nodes';
   stdout.writeln('suite: ${puzzles.length} positions  budget: $budget  '
-      'workers: $workers\n');
+      'workers: $workers${ab != null ? ' +AB' : ''}\n');
 
   var solved = 0;
   var totalMs = 0;
@@ -109,22 +115,50 @@ Future<void> main(List<String> args) async {
     }
 
     final sw = Stopwatch()..start();
-    final stats = pool != null
-        ? await mcts.searchBudgetAsync(p.fen,
-            nodes: nodes, time: _dur(movetime))
-        : mcts.searchBudget(p.fen, nodes: nodes, time: _dur(movetime));
+    final abByFen = <String, AbInfo>{};
+    final searchFut = pool != null
+        ? mcts.searchBudgetAsync(p.fen, nodes: nodes, time: _dur(movetime))
+        : Future.value(
+            mcts.searchBudget(p.fen, nodes: nodes, time: _dur(movetime)));
+    if (ab != null && movetime != null) {
+      final deadline = DateTime.now().add(Duration(milliseconds: movetime));
+      // Feed the root + MCTS best-move nodes to alpha-beta until time runs out.
+      Future<void> feed() async {
+        while (DateTime.now().isBefore(deadline)) {
+          final focus = <String>[p.fen, ...mcts.topRootChildFens(2)];
+          final pri = mcts.focusPriors(2);
+          final priors = [for (final f in focus) pri[f]];
+          final infos = await ab.focus(focus, priors, 250);
+          for (final info in infos) {
+            abByFen[info.fen] = info;
+          }
+        }
+      }
+
+      await Future.wait([searchFut, feed()]);
+    }
+    final stats = await searchFut;
     sw.stop();
     totalMs += sw.elapsedMilliseconds;
 
-    final engUci = stats.isEmpty ? '----' : stats.first.uci;
+    final mctsUci = stats.isEmpty ? '----' : stats.first.uci;
+    final engUci = ab != null && stats.isNotEmpty
+        ? combineRoot(
+            rootFen: p.fen,
+            mctsStats: stats,
+            childFenByUci: mcts.rootChildFens(),
+            abByFen: abByFen)
+        : mctsUci;
     final ok = p.bm.isNotEmpty
         ? wantUci.contains(engUci)
         : !avoidUci.contains(engUci);
     if (ok) solved++;
     final tag = ok ? 'OK  ' : 'FAIL';
     final want = p.bm.isNotEmpty ? 'bm ${p.bm.join('/')}' : 'am ${p.am.join('/')}';
+    final overrode = ab != null && engUci != mctsUci;
     stdout.writeln('$tag ${p.id.padRight(10)} '
         'engine=${(uciToSan[engUci] ?? engUci).padRight(7)} $want  '
+        '${overrode ? '[AB<-${uciToSan[mctsUci] ?? mctsUci}] ' : ''}'
         '(${sw.elapsedMilliseconds} ms)');
   }
 
@@ -132,6 +166,7 @@ Future<void> main(List<String> args) async {
       '(${(100 * solved / puzzles.length).toStringAsFixed(1)}%)  '
       'avg ${(totalMs / puzzles.length).toStringAsFixed(0)} ms/pos');
   pool?.dispose();
+  ab?.dispose();
 }
 
 Duration? _dur(int? ms) => ms == null ? null : Duration(milliseconds: ms);

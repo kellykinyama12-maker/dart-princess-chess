@@ -10,3 +10,4 @@ training_data/
 
 # Scratch logs
 *.log
+*.pgn
