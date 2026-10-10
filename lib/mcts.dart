@@ -3,7 +3,6 @@ import 'dart:math' as math;
 
 import 'package:chess/chess.dart' as ch;
 
-import 'alphabeta.dart';
 import 'ab_worker.dart';
 import 'board_expand.dart';
 import 'eval_pool.dart';
@@ -19,7 +18,6 @@ class _Stats {
   // like [abWeight] extra visits — stat transfer from the AB worker.
   double abValue = 0.0;
   int abWeight = 0;
-  int abDepth = 0; // deepest embedded alpha-beta searched here (for ID)
 }
 
 /// A single MCTS tree node. Values are stored from the perspective of the side
@@ -46,9 +44,9 @@ class _Node {
   int get vloss => _s.vloss;
   set vloss(int v) => _s.vloss = v;
   int get abWeight => _s.abWeight;
+  set abWeight(int v) => _s.abWeight = v;
   double get abValue => _s.abValue;
-  int get abDepth => _s.abDepth;
-  set abDepth(int v) => _s.abDepth = v;
+  set abValue(double v) => _s.abValue = v;
 
   /// Value estimate blending MCTS visits with the AB value prior.
   double get q {
@@ -80,17 +78,20 @@ class Mcts {
   final double fpuReduction; // penalty applied to unvisited children (FPU)
   final int batchSize; // >1 collects a batch of distinct leaves via virtual loss
   final bool transpositions; // share stats across nodes with the same Zobrist key
-  final double abProb; // per-ply chance a rollout commits to alpha-beta descent
+  // When set (pooled path only), each batch runs an alpha-beta search on the
+  // frontier leaf while the net evaluation is in flight, blending the result
+  // in as a value prior — using the otherwise-idle net latency for free.
+  final bool abLatency;
   final math.Random _rng;
 
-  // Embedded alpha-beta searcher (classical eval, persistent TT) used by the
-  // unified rollout. Depth per position is iteratively deepened, capped here.
+  // Depth cap for the alpha-beta search; it is otherwise bounded by the net
+  // latency (so it runs "for free" until the net results arrive).
   static const int _abMaxDepth = 10;
-  AlphaBeta _abSearcher = AlphaBeta();
+  double _nnLatencyMs = 20; // rolling estimate of a net batch's wall time
 
-  // Off-main-isolate AB searcher for the pooled/async rollout, so alpha-beta
+  // Off-main-isolate AB searcher for the latency-filled rollout, so alpha-beta
   // runs concurrently with the net evaluations in flight (spawned lazily the
-  // first time an AB leaf appears, kept across searches for TT reuse).
+  // first time it is needed, kept across searches for TT reuse).
   AbWorker? _abWorker;
   Future<AbWorker>? _abWorkerStarting;
 
@@ -107,7 +108,7 @@ class Mcts {
     this.fpuReduction = 0.2,
     this.batchSize = 1,
     this.transpositions = true,
-    this.abProb = 0.0,
+    this.abLatency = false,
     int? seed,
   })  : pool = null,
         _rng = math.Random(seed);
@@ -123,7 +124,7 @@ class Mcts {
     this.fpuReduction = 0.2,
     this.batchSize = 8,
     this.transpositions = true,
-    this.abProb = 0.0,
+    this.abLatency = false,
     int? seed,
   })  : eval = null,
         _rng = math.Random(seed);
@@ -182,7 +183,6 @@ class Mcts {
   void reset() {
     _root = null;
     _tt.clear();
-    _abSearcher = AlphaBeta();
   }
 
   /// Releases the rollout AB worker isolate, if one was spawned.
@@ -345,53 +345,63 @@ class Mcts {
   }
 
   /// Collects [count] leaves (virtual loss), expands the unique unexpanded ones
-  /// concurrently on the pool, then backs the values up. AB-selected leaves are
-  /// searched on a worker isolate in parallel, so alpha-beta compute overlaps
-  /// the net evaluations instead of blocking the main isolate.
+  /// concurrently on the pool, then backs the values up. While the net batch is
+  /// in flight, an alpha-beta search runs on the frontier leaf (off the main
+  /// isolate, bounded by the net latency) and its score is blended into that
+  /// leaf as a value prior.
   Future<void> _runBatchAsync(_Node root, int count) async {
-    final rollouts = <(List<_Node>, int)>[];
+    final paths = <List<_Node>>[];
     for (var b = 0; b < count; b++) {
-      rollouts.add(_collectLeafAb(root));
+      paths.add(_collectLeaf(root));
     }
     final values = <_Node, double>{};
-    final leaves = <_Node>[]; // unique net leaves to expand on the pool
-    final abLeaves = <_Node>[]; // unique AB leaves to search on the worker
-    for (final (path, abDepth) in rollouts) {
+    final leaves = <_Node>[];
+    for (final path in paths) {
       final leaf = path.last;
-      if (abDepth > 0 && !leaf.terminal) {
-        if (!values.containsKey(leaf) && !abLeaves.contains(leaf)) {
-          abLeaves.add(leaf);
-        }
-        continue;
-      }
       if (values.containsKey(leaf) || leaf.children != null) {
         if (leaf.terminal) values[leaf] = leaf.terminalValue;
         continue;
       }
       if (!leaves.contains(leaf)) leaves.add(leaf);
     }
-    // Launch net and alpha-beta concurrently; await both.
+    // Launch the net batch; spend its latency on an alpha-beta search of the
+    // root child the search currently favours, blending the score back as a
+    // prior so it steers the root decision (a node MCTS has already visited,
+    // and visited enough that the AB weight stays balanced).
+    final sw = Stopwatch()..start();
     final nnFuture = Future.wait(
         [for (final leaf in leaves) pool!.expand(leaf.fen, leaf.stm, leaf.key)]);
+    _Node? abNode;
     Future<List<AbInfo>>? abFuture;
-    if (abLeaves.isNotEmpty) {
-      final worker = await _ensureAbWorker();
-      abFuture = worker.rollout(
-          [for (final l in abLeaves) l.fen],
-          [for (final l in abLeaves) l.abDepth],
-          30);
+    if (abLatency && paths.first.length > 1) {
+      final cand = paths.first[1]; // root child on the first (greedy) rollout
+      if (!cand.terminal) {
+        abNode = cand;
+        final worker = await _ensureAbWorker();
+        abFuture = worker.rollout(
+            [abNode.fen], [_abMaxDepth], _nnLatencyMs.round().clamp(5, 1000));
+      }
     }
     final results = await nnFuture;
+    sw.stop();
+    _nnLatencyMs = 0.8 * _nnLatencyMs + 0.2 * sw.elapsedMicroseconds / 1000.0;
     for (var i = 0; i < leaves.length; i++) {
       values[leaves[i]] = _applyExpandResult(leaves[i], results[i]);
     }
-    if (abFuture != null) {
+    if (abFuture != null && abNode != null) {
       final infos = await abFuture;
-      for (var i = 0; i < abLeaves.length; i++) {
-        values[abLeaves[i]] = _abInfoValue(infos[i]);
+      if (infos.isNotEmpty) {
+        final inj = abInjection(infos.first);
+        if (inj != null) {
+          abNode.abValue = inj.value;
+          // Cap the prior by the node's own visit evidence so a shallow,
+          // latency-bounded search can inform but never overwhelm the net
+          // (keeps the weight balanced across fast and slow nets).
+          abNode.abWeight = math.min(inj.weight, math.max(1, abNode.visits));
+        }
       }
     }
-    for (final (path, _) in rollouts) {
+    for (final path in paths) {
       _backup(path, values[path.last] ?? path.last.terminalValue);
     }
   }
@@ -521,31 +531,22 @@ class Mcts {
   /// batching that virtual loss enables (network eval stays sequential on CPU;
   /// true parallelism would run the evals on isolates).
   void _runBatch(_Node root, int count) {
-    final rollouts = <(List<_Node>, int)>[];
+    final paths = <List<_Node>>[];
     for (var b = 0; b < count; b++) {
-      rollouts.add(_collectLeafAb(root));
+      paths.add(_collectLeaf(root));
     }
     final values = <_Node, double>{};
-    for (final (path, abDepth) in rollouts) {
+    for (final path in paths) {
       final leaf = path.last;
-      final double v;
-      if (abDepth > 0 && !leaf.terminal) {
-        v = _abEval(leaf, abDepth);
-      } else {
-        v = values.putIfAbsent(
-            leaf, () => leaf.terminal ? leaf.terminalValue : _expand(leaf));
-      }
+      final v = values.putIfAbsent(
+          leaf, () => leaf.terminal ? leaf.terminalValue : _expand(leaf));
       _backup(path, v);
     }
   }
 
   /// Descends from [root] to an unexpanded/terminal leaf, applying a virtual
   /// loss to every node on the path.
-  /// Descends from [root] to a leaf. Beyond the root, with probability [abProb]
-  /// a node is evaluated by an embedded iteratively-deepened alpha-beta search
-  /// instead of descending further; returns the path and that AB depth (0 = a
-  /// normal leaf). Virtual loss is applied along the path.
-  (List<_Node>, int) _collectLeafAb(_Node root) {
+  List<_Node> _collectLeaf(_Node root) {
     final path = <_Node>[];
     var node = root;
     node.vloss++;
@@ -553,16 +554,6 @@ class Mcts {
     while (!node.terminal &&
         node.children != null &&
         node.children!.isNotEmpty) {
-      // Only an MCTS-visited (expanded) node may be handed to alpha-beta; a node
-      // that merely has children via a transposition isn't a valid AB leaf yet.
-      if (abProb > 0 &&
-          !identical(node, root) &&
-          node.visits > 0 &&
-          _rng.nextDouble() < abProb) {
-        final d = (node.abDepth + 1).clamp(1, _abMaxDepth);
-        node.abDepth = d;
-        return (path, d);
-      }
       final parentVisits = node.visits + node.vloss;
       final parentQ = node.q; // FPU baseline for unvisited children
       _Node? best;
@@ -589,28 +580,7 @@ class Mcts {
       node.vloss++;
       path.add(node);
     }
-    return (path, 0);
-  }
-
-  /// Embedded alpha-beta value of [node] to [depth] (position STM POV, [-1,1]),
-  /// run inline (used by the single-threaded path).
-  double _abEval(_Node node, int depth) {
-    final r = _abSearcher.search(node.fen,
-        maxDepth: depth, time: const Duration(milliseconds: 30));
-    return _abScoreValue(r.scoreCp, r.isMate);
-  }
-
-  /// Converts an alpha-beta result from the rollout worker to a node-POV value.
-  double _abInfoValue(AbInfo r) => _abScoreValue(r.scoreCp, r.mate);
-
-  /// Maps an alpha-beta centipawn score (STM POV) to a [-1,1] value.
-  double _abScoreValue(int scoreCp, bool mate) {
-    if (mate) return scoreCp > 0 ? 1.0 : -1.0;
-    final x = scoreCp / 400.0;
-    if (x > 20) return 1.0;
-    if (x < -20) return -1.0;
-    final e = math.exp(2 * x);
-    return (e - 1) / (e + 1); // tanh
+    return path;
   }
 
   /// Backs the leaf-POV value [vLeaf] up [path], flipping sign each ply and
