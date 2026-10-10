@@ -12,6 +12,7 @@ import 'lc0_evaluator.dart';
 class _Node {
   final String fen;
   final int stm; // side to move: 0 = White, 1 = Black
+  final int key; // Zobrist hash, maintained incrementally
   double prior; // mutable so root exploration noise can be mixed in
 
   int visits = 0;
@@ -23,7 +24,7 @@ class _Node {
   bool noiseApplied = false; // guards one-time Dirichlet noise per search root
   int vloss = 0; // pending virtual losses while a playout is in flight
 
-  _Node(this.fen, this.stm, this.prior);
+  _Node(this.fen, this.stm, this.prior, this.key);
 
   double get q => visits == 0 ? 0.0 : valueSum / visits;
 }
@@ -171,7 +172,9 @@ class Mcts {
 
   _Node _prepareRoot(String rootFen) {
     final reuse = _root != null && _root!.fen == rootFen;
-    final root = reuse ? _root! : _Node(rootFen, _stm(rootFen), 1.0);
+    final root = reuse
+        ? _root!
+        : _Node(rootFen, _stm(rootFen), 1.0, boardZobrist.ofFen(rootFen));
     _root = root;
     // Expand the root first so exploration noise can be seeded on its children.
     if (root.children == null) {
@@ -247,11 +250,13 @@ class Mcts {
       {int? nodes, Duration? time}) async {
     _stopFlag = false;
     final reuse = _root != null && _root!.fen == rootFen;
-    final root = reuse ? _root! : _Node(rootFen, _stm(rootFen), 1.0);
+    final root = reuse
+        ? _root!
+        : _Node(rootFen, _stm(rootFen), 1.0, boardZobrist.ofFen(rootFen));
     _root = root;
 
     if (root.children == null) {
-      _applyExpandResult(root, await pool!.expand(root.fen, root.stm));
+      _applyExpandResult(root, await pool!.expand(root.fen, root.stm, root.key));
     }
     _applyRootNoise(root);
 
@@ -283,7 +288,7 @@ class Mcts {
       if (!leaves.contains(leaf)) leaves.add(leaf);
     }
     final results = await Future.wait(
-        [for (final leaf in leaves) pool!.expand(leaf.fen, leaf.stm)]);
+        [for (final leaf in leaves) pool!.expand(leaf.fen, leaf.stm, leaf.key)]);
     for (var i = 0; i < leaves.length; i++) {
       values[leaves[i]] = _applyExpandResult(leaves[i], results[i]);
     }
@@ -304,7 +309,7 @@ class Mcts {
     node.children = <String, _Node>{};
     for (var i = 0; i < r.legal.length; i++) {
       node.children![r.legal[i]] =
-          _Node(r.childFens[i], 1 - node.stm, r.priors[i]);
+          _Node(r.childFens[i], 1 - node.stm, r.priors[i], r.childKeys[i]);
     }
     return r.value;
   }
@@ -478,24 +483,28 @@ class Mcts {
   /// Generates legal moves + resulting child FENs (or marks [node] terminal)
   /// without running the network, so the eval can be offloaded to a pool.
   _Prep _prepareExpand(_Node node) {
-    final exp = expandBoard(node.fen);
+    final exp = expandBoard(node.fen, node.key);
     if (exp.gameOver) {
       node.terminal = true;
       node.children = <String, _Node>{};
       node.terminalValue = exp.checkmate ? -1.0 : 0.0; // mated STM loses
-      return _Prep(const [], const {});
+      return _Prep(const [], const {}, const {});
     }
     final childFen = <String, String>{
       for (var i = 0; i < exp.legal.length; i++) exp.legal[i]: exp.childFens[i]
     };
-    return _Prep(exp.legal, childFen);
+    final childKey = <String, int>{
+      for (var i = 0; i < exp.legal.length; i++) exp.legal[i]: exp.childKeys[i]
+    };
+    return _Prep(exp.legal, childFen, childKey);
   }
 
   double _applyExpansion(_Node node, _Prep prep, Evaluation e) {
     node.children = <String, _Node>{};
     for (final uci in prep.legal) {
-      node.children![uci] =
-          _Node(prep.childFen[uci]!, 1 - node.stm, e.priors[uci] ?? 0.0);
+      node.children![uci] = _Node(
+          prep.childFen[uci]!, 1 - node.stm, e.priors[uci] ?? 0.0,
+          prep.childKey[uci]!);
     }
     return e.value;
   }
@@ -509,5 +518,6 @@ class Mcts {
 class _Prep {
   final List<String> legal;
   final Map<String, String> childFen;
-  _Prep(this.legal, this.childFen);
+  final Map<String, int> childKey;
+  _Prep(this.legal, this.childFen, this.childKey);
 }
