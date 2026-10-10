@@ -63,6 +63,11 @@ class AlphaBeta {
   // Quiet-move cost grows with depth: 1 near the root, more deeper, so long
   // quiet sequences are budget-prohibitive (loose at root, tight with depth).
   static const int _quietStep = 2;
+  // Net policy per PV position for interior move ordering; probed between
+  // iterations via [policyProbe] and cached by zobrist key.
+  Map<String, double>? Function(String fen)? policyProbe;
+  final Map<int, Map<String, double>> nodePriors = {};
+  static const int _pvProbeLen = 8;
 
   AlphaBeta(
       {Map<int, _Tt>? sharedTt,
@@ -144,6 +149,7 @@ class AlphaBeta {
       reached = depth;
       _store(_zobrist(), depth, bestScore, 0, bestMove);
       if (bestScore.abs() >= mateScore - 1000) break;
+      _probePv();
     }
 
     return AbResult(
@@ -247,7 +253,7 @@ class AlphaBeta {
       // No legal moves: checkmate (bad) or stalemate (draw).
       return _b.king_attacked(_b.turn) ? -(mateScore - ply) : 0;
     }
-    _order(moves, ttMove);
+    _order(moves, ttMove, null, key);
 
     final origAlpha = alpha;
     var best = -_inf;
@@ -354,6 +360,7 @@ class AlphaBeta {
       // PV resolved within budget (used fewer quiet moves than allowed): the
       // position's complexity is known, no need to deepen further.
       if (bestMove != null && info.$2 < budget) break;
+      _probePv();
     }
     return AbResult(bestMove == null ? null : _uci(bestMove), bestScore,
         reached, _extractPv(16), _nodes);
@@ -483,7 +490,7 @@ class AlphaBeta {
       if (standPat > alpha) alpha = standPat;
     }
 
-    _order(moves, ttMove);
+    _order(moves, ttMove, null, key);
     ch.Move? bestMove;
     const tacticalMask = ch.Chess.BITS_CAPTURE |
         ch.Chess.BITS_EP_CAPTURE |
@@ -635,7 +642,8 @@ class AlphaBeta {
   }
 
   void _order(List<ch.Move> moves, ch.Move? first,
-      [Map<String, double>? priors]) {
+      [Map<String, double>? priors, int? key]) {
+    priors ??= (key != null && nodePriors.isNotEmpty) ? nodePriors[key] : null;
     int score(ch.Move m) {
       if (first != null && m.from == first.from && m.to == first.to) {
         return 1 << 28;
@@ -658,6 +666,33 @@ class AlphaBeta {
     }
 
     moves.sort((a, b) => score(b).compareTo(score(a)));
+  }
+
+  /// Probes the net policy on the first [_pvProbeLen] PV positions and caches it
+  /// by zobrist key, so subsequent iterations order those interior nodes by net
+  /// policy. No-op when [policyProbe] is unset.
+  void _probePv() {
+    final probe = policyProbe;
+    if (probe == null) return;
+    final made = <ch.Move>[];
+    var count = 0;
+    while (count < _pvProbeLen) {
+      final k = _zobrist();
+      if (!nodePriors.containsKey(k)) {
+        final pr = probe(_b.generate_fen());
+        if (pr != null) nodePriors[k] = pr;
+      }
+      final tte = tt[k];
+      if (tte == null || tte.from < 0) break;
+      final m = _moveFromSquares(tte.from, tte.to);
+      if (m == null) break;
+      _b.make_move(m);
+      made.add(m);
+      count++;
+    }
+    for (var i = made.length - 1; i >= 0; i--) {
+      _b.undo_move();
+    }
   }
 
   void _store(int key, int depth, int score, int flag, ch.Move? m) {

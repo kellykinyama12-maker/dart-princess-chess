@@ -43,6 +43,19 @@ void main(List<String> args) {
       complexity: complexity);
   ab.cxVerbose = cxVerbose;
   final orderer = orderNet != null ? Lc0Evaluator.load(orderNet) : null;
+  if (orderer != null) {
+    ab.policyProbe = (fen) {
+      final b = ch.Chess.fromFEN(fen);
+      final legal = [
+        for (final mv in (b.moves({'asObjects': true}) as List).cast<ch.Move>())
+          mv.fromAlgebraic + mv.toAlgebraic + (mv.promotion?.name ?? '')
+      ];
+      if (legal.isEmpty) return null;
+      return orderer
+          .evaluate(fen, b.turn == ch.Chess.WHITE ? 0 : 1, legal)
+          .priors;
+    };
+  }
   var solved = 0, total = 0, totalMs = 0, totalNodes = 0;
   for (final f in files) {
     if (!File(f).existsSync()) {
