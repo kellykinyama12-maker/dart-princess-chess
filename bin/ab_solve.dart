@@ -14,6 +14,7 @@ void main(List<String> args) {
   var maxDepth = 64;
   String? nnuePath;
   var complexity = false;
+  var cxVerbose = false;
   final files = <String>[];
   for (var i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -25,6 +26,8 @@ void main(List<String> args) {
         nnuePath = args[++i];
       case '--complexity':
         complexity = true;
+      case '--cxverbose':
+        cxVerbose = true;
       default:
         files.add(args[i]);
     }
@@ -34,6 +37,7 @@ void main(List<String> args) {
   final ab = AlphaBeta(
       nnue: nnuePath != null ? Nnue.load(nnuePath) : null,
       complexity: complexity);
+  ab.cxVerbose = cxVerbose;
   var solved = 0, total = 0, totalMs = 0, totalNodes = 0;
   for (final f in files) {
     if (!File(f).existsSync()) {

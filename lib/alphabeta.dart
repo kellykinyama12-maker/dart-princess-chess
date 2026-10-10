@@ -59,6 +59,7 @@ class AlphaBeta {
   final bool complexity;
   static const int _maxPly = 64;
   int _plyCap = _maxPly; // forcing-extension depth cap for the current budget
+  bool cxVerbose = false; // log the complexity ID progression
 
   AlphaBeta(
       {Map<int, _Tt>? sharedTt,
@@ -341,7 +342,15 @@ class AlphaBeta {
       bestMove = localBestMove;
       reached = budget;
       _store(_zobrist(), budget, bestScore, 0, bestMove);
+      final info = _pvInfo(32);
+      if (cxVerbose) {
+        print('  budget=$budget score=$bestScore pvLen=${info.$1} '
+            'pvCx=${info.$2} nodes=$_nodes');
+      }
       if (bestScore.abs() >= mateScore - 1000) break;
+      // PV resolved within budget (used fewer quiet moves than allowed): the
+      // position's complexity is known, no need to deepen further.
+      if (bestMove != null && info.$2 < budget) break;
     }
     return AbResult(bestMove == null ? null : _uci(bestMove), bestScore,
         reached, _extractPv(16), _nodes);
@@ -544,6 +553,27 @@ class AlphaBeta {
       if (m.from == from && m.to == to) return m;
     }
     return null;
+  }
+
+  /// (pv length in plies, quiet-move count) of the TT principal variation.
+  (int, int) _pvInfo(int maxLen) {
+    var len = 0, quiet = 0;
+    final made = <ch.Move>[];
+    while (len < maxLen) {
+      final tte = tt[_zobrist()];
+      if (tte == null || tte.from < 0) break;
+      final m = _moveFromSquares(tte.from, tte.to);
+      if (m == null) break;
+      final inCheck = _b.king_attacked(_b.turn);
+      _b.make_move(m);
+      if (!(inCheck || _isForcing(m, _b.king_attacked(_b.turn)))) quiet++;
+      made.add(m);
+      len++;
+    }
+    for (var i = made.length - 1; i >= 0; i--) {
+      _b.undo_move();
+    }
+    return (len, quiet);
   }
 
   List<String> _extractPv(int maxLen) {
