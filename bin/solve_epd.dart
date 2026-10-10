@@ -22,6 +22,7 @@ Future<void> main(List<String> args) async {
   int? movetime;
   var workers = 1;
   var useAb = false;
+  var abProb = 0.0; // unified-rollout alpha-beta probability
   String? net;
   final files = <String>[];
   for (var i = 0; i < args.length; i++) {
@@ -36,6 +37,8 @@ Future<void> main(List<String> args) async {
         workers = int.parse(args[++i]);
       case '--ab':
         useAb = true;
+      case '--abprob':
+        abProb = int.parse(args[++i]) / 100.0;
       case '--net':
         net = args[++i];
       default:
@@ -70,7 +73,8 @@ Future<void> main(List<String> args) async {
   Mcts mcts;
   if (workers > 1) {
     pool = await EvalPool.start(weightsPath, workers);
-    mcts = Mcts.pooled(pool, batchSize: workers * 2, addRootNoise: false);
+    mcts = Mcts.pooled(pool,
+        batchSize: workers * 2, addRootNoise: false, abProb: abProb);
   } else {
     mcts = Mcts(Lc0Evaluator.load(weightsPath), addRootNoise: false);
   }

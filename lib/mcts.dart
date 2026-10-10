@@ -3,6 +3,7 @@ import 'dart:math' as math;
 
 import 'package:chess/chess.dart' as ch;
 
+import 'alphabeta.dart';
 import 'board_expand.dart';
 import 'eval_pool.dart';
 import 'lc0_evaluator.dart';
@@ -17,6 +18,7 @@ class _Stats {
   // like [abWeight] extra visits — stat transfer from the AB worker.
   double abValue = 0.0;
   int abWeight = 0;
+  int abDepth = 0; // deepest embedded alpha-beta searched here (for ID)
 }
 
 /// A single MCTS tree node. Values are stored from the perspective of the side
@@ -44,6 +46,8 @@ class _Node {
   set vloss(int v) => _s.vloss = v;
   int get abWeight => _s.abWeight;
   double get abValue => _s.abValue;
+  int get abDepth => _s.abDepth;
+  set abDepth(int v) => _s.abDepth = v;
 
   /// Value estimate blending MCTS visits with the AB value prior.
   double get q {
@@ -75,7 +79,13 @@ class Mcts {
   final double fpuReduction; // penalty applied to unvisited children (FPU)
   final int batchSize; // >1 collects a batch of distinct leaves via virtual loss
   final bool transpositions; // share stats across nodes with the same Zobrist key
+  final double abProb; // per-ply chance a rollout commits to alpha-beta descent
   final math.Random _rng;
+
+  // Embedded alpha-beta searcher (classical eval, persistent TT) used by the
+  // unified rollout. Depth per position is iteratively deepened, capped here.
+  static const int _abMaxDepth = 10;
+  AlphaBeta _abSearcher = AlphaBeta();
 
   _Node? _root; // persisted across searches to enable tree reuse
   final Map<int, _Stats> _tt = {}; // Zobrist key -> shared stats
@@ -90,6 +100,7 @@ class Mcts {
     this.fpuReduction = 0.2,
     this.batchSize = 1,
     this.transpositions = true,
+    this.abProb = 0.0,
     int? seed,
   })  : pool = null,
         _rng = math.Random(seed);
@@ -105,6 +116,7 @@ class Mcts {
     this.fpuReduction = 0.2,
     this.batchSize = 8,
     this.transpositions = true,
+    this.abProb = 0.0,
     int? seed,
   })  : eval = null,
         _rng = math.Random(seed);
@@ -163,6 +175,7 @@ class Mcts {
   void reset() {
     _root = null;
     _tt.clear();
+    _abSearcher = AlphaBeta();
   }
 
   /// Stat transfer from alpha-beta: records [value] (position side-to-move POV,
@@ -320,14 +333,18 @@ class Mcts {
   /// Collects [count] leaves (virtual loss), expands the unique unexpanded ones
   /// concurrently on the pool, then backs the values up.
   Future<void> _runBatchAsync(_Node root, int count) async {
-    final paths = <List<_Node>>[];
+    final rollouts = <(List<_Node>, int)>[];
     for (var b = 0; b < count; b++) {
-      paths.add(_collectLeaf(root));
+      rollouts.add(_collectLeafAb(root));
     }
     final values = <_Node, double>{};
     final leaves = <_Node>[];
-    for (final path in paths) {
+    for (final (path, abDepth) in rollouts) {
       final leaf = path.last;
+      if (abDepth > 0 && !leaf.terminal) {
+        values[leaf] = _abEval(leaf, abDepth); // embedded alpha-beta
+        continue;
+      }
       if (values.containsKey(leaf) || leaf.children != null) {
         if (leaf.terminal) values[leaf] = leaf.terminalValue;
         continue;
@@ -339,7 +356,7 @@ class Mcts {
     for (var i = 0; i < leaves.length; i++) {
       values[leaves[i]] = _applyExpandResult(leaves[i], results[i]);
     }
-    for (final path in paths) {
+    for (final (path, _) in rollouts) {
       _backup(path, values[path.last] ?? path.last.terminalValue);
     }
   }
@@ -459,22 +476,31 @@ class Mcts {
   /// batching that virtual loss enables (network eval stays sequential on CPU;
   /// true parallelism would run the evals on isolates).
   void _runBatch(_Node root, int count) {
-    final paths = <List<_Node>>[];
+    final rollouts = <(List<_Node>, int)>[];
     for (var b = 0; b < count; b++) {
-      paths.add(_collectLeaf(root));
+      rollouts.add(_collectLeafAb(root));
     }
     final values = <_Node, double>{};
-    for (final path in paths) {
+    for (final (path, abDepth) in rollouts) {
       final leaf = path.last;
-      final v = values.putIfAbsent(
-          leaf, () => leaf.terminal ? leaf.terminalValue : _expand(leaf));
+      final double v;
+      if (abDepth > 0 && !leaf.terminal) {
+        v = _abEval(leaf, abDepth);
+      } else {
+        v = values.putIfAbsent(
+            leaf, () => leaf.terminal ? leaf.terminalValue : _expand(leaf));
+      }
       _backup(path, v);
     }
   }
 
   /// Descends from [root] to an unexpanded/terminal leaf, applying a virtual
   /// loss to every node on the path.
-  List<_Node> _collectLeaf(_Node root) {
+  /// Descends from [root] to a leaf. Beyond the root, with probability [abProb]
+  /// a node is evaluated by an embedded iteratively-deepened alpha-beta search
+  /// instead of descending further; returns the path and that AB depth (0 = a
+  /// normal leaf). Virtual loss is applied along the path.
+  (List<_Node>, int) _collectLeafAb(_Node root) {
     final path = <_Node>[];
     var node = root;
     node.vloss++;
@@ -482,6 +508,13 @@ class Mcts {
     while (!node.terminal &&
         node.children != null &&
         node.children!.isNotEmpty) {
+      if (abProb > 0 &&
+          !identical(node, root) &&
+          _rng.nextDouble() < abProb) {
+        final d = (node.abDepth + 1).clamp(1, _abMaxDepth);
+        node.abDepth = d;
+        return (path, d);
+      }
       final parentVisits = node.visits + node.vloss;
       final parentQ = node.q; // FPU baseline for unvisited children
       _Node? best;
@@ -508,7 +541,19 @@ class Mcts {
       node.vloss++;
       path.add(node);
     }
-    return path;
+    return (path, 0);
+  }
+
+  /// Embedded alpha-beta value of [node] to [depth] (position STM POV, [-1,1]).
+  double _abEval(_Node node, int depth) {
+    final r = _abSearcher.search(node.fen,
+        maxDepth: depth, time: const Duration(milliseconds: 30));
+    if (r.isMate) return r.scoreCp > 0 ? 1.0 : -1.0;
+    final x = r.scoreCp / 400.0;
+    if (x > 20) return 1.0;
+    if (x < -20) return -1.0;
+    final e = math.exp(2 * x);
+    return (e - 1) / (e + 1); // tanh
   }
 
   /// Backs the leaf-POV value [vLeaf] up [path], flipping sign each ply and
