@@ -371,6 +371,79 @@ class AlphaBeta {
                   ch.Chess.BITS_QSIDE_CASTLE)) !=
           0;
 
+  /// SEE-lite: a capture is losing if the capturer outvalues the captured piece
+  /// and the target square is still defended by the opponent.
+  bool _losingCapture(ch.Move m) {
+    final captured = m.captured;
+    if (captured == null) return false;
+    if (_pieceVal[m.piece.shift] <= _pieceVal[captured.shift]) return false;
+    final them =
+        m.color == ch.Chess.WHITE ? ch.Chess.BLACK : ch.Chess.WHITE;
+    return _attackedBy(m.to, them);
+  }
+
+  /// Whether [byColor] attacks 0x88 square [sq] on the current board.
+  bool _attackedBy(int sq, ch.Color byColor) {
+    for (final d in const [-18, -33, -31, -14, 18, 33, 31, 14]) {
+      final t = sq + d;
+      if ((t & 0x88) == 0) {
+        final p = _b.board[t];
+        if (p != null && p.color == byColor && p.type == ch.Chess.KNIGHT) {
+          return true;
+        }
+      }
+    }
+    for (final d in const [-17, -16, -15, -1, 1, 15, 16, 17]) {
+      final t = sq + d;
+      if ((t & 0x88) == 0) {
+        final p = _b.board[t];
+        if (p != null && p.color == byColor && p.type == ch.Chess.KING) {
+          return true;
+        }
+      }
+    }
+    final pawnDirs =
+        byColor == ch.Chess.WHITE ? const [15, 17] : const [-15, -17];
+    for (final d in pawnDirs) {
+      final t = sq + d;
+      if ((t & 0x88) == 0) {
+        final p = _b.board[t];
+        if (p != null && p.color == byColor && p.type == ch.Chess.PAWN) {
+          return true;
+        }
+      }
+    }
+    for (final d in const [-1, 1, -16, 16]) {
+      var t = sq + d;
+      while ((t & 0x88) == 0) {
+        final p = _b.board[t];
+        if (p != null) {
+          if (p.color == byColor &&
+              (p.type == ch.Chess.ROOK || p.type == ch.Chess.QUEEN)) {
+            return true;
+          }
+          break;
+        }
+        t += d;
+      }
+    }
+    for (final d in const [-15, 15, -17, 17]) {
+      var t = sq + d;
+      while ((t & 0x88) == 0) {
+        final p = _b.board[t];
+        if (p != null) {
+          if (p.color == byColor &&
+              (p.type == ch.Chess.BISHOP || p.type == ch.Chess.QUEEN)) {
+            return true;
+          }
+          break;
+        }
+        t += d;
+      }
+    }
+    return false;
+  }
+
   /// Negamax on a complexity budget. Quiet moves cost 1, forcing moves cost 0
   /// and extend for free. At budget <= 0 (and not in check) the node is a
   /// quiescence leaf: stand-pat, then search only forcing moves.
@@ -446,12 +519,23 @@ class AlphaBeta {
       if (bestExcl < target) singular = ttMove; // only the TT move holds
     }
 
+    const captureMask = ch.Chess.BITS_CAPTURE | ch.Chess.BITS_EP_CAPTURE;
+    const freeMask = ch.Chess.BITS_PROMOTION |
+        ch.Chess.BITS_KSIDE_CASTLE |
+        ch.Chess.BITS_QSIDE_CASTLE;
     for (final m in moves) {
-      // Quiescence (budget exhausted): only captures/promotions, which
-      // self-limit as material runs out; quiet checks would chain unboundedly.
       if (atLeaf && (m.flags & tacticalMask) == 0) continue;
+      final losing = (m.flags & captureMask) != 0 && _losingCapture(m);
+      if (atLeaf && losing) continue; // quiescence skips losing captures
       _b.make_move(m);
-      var forcing = inCheck || _isForcing(m, _b.king_attacked(_b.turn));
+      final givesCheck = _b.king_attacked(_b.turn);
+      // Forcing (cost 0): checks, replies to check, promotions/castling, and
+      // winning/equal captures. Losing captures cost budget so they don't
+      // extend for free and blow up the tree.
+      var forcing = inCheck ||
+          givesCheck ||
+          (m.flags & freeMask) != 0 ||
+          ((m.flags & captureMask) != 0 && !losing);
       if (singular != null &&
           m.from == singular.from &&
           m.to == singular.to) {
