@@ -417,12 +417,46 @@ class AlphaBeta {
         ch.Chess.BITS_PROMOTION |
         ch.Chess.BITS_KSIDE_CASTLE |
         ch.Chess.BITS_QSIDE_CASTLE;
+
+    // Singular detection: if the TT move is much better than every alternative
+    // (an exclusion search of the others fails low), it is effectively forced,
+    // so it costs 0 (extends for free) like a reply to check.
+    ch.Move? singular;
+    if (ttMove != null &&
+        tte != null &&
+        budget >= 3 &&
+        tte.depth >= budget - 1 &&
+        tte.flag != 2 &&
+        tte.score.abs() < mateScore - 1000) {
+      final target = tte.score - (40 + budget * 8);
+      final singBudget = (budget - 1) ~/ 2;
+      var bestExcl = -_inf;
+      for (final m in moves) {
+        if (m.from == ttMove.from && m.to == ttMove.to) continue;
+        _b.make_move(m);
+        final forcing = inCheck || _isForcing(m, _b.king_attacked(_b.turn));
+        final cost = forcing ? 0 : (1 + ply ~/ _quietStep);
+        final s =
+            -_negamaxC(singBudget - cost, -target, -(target - 1), ply + 1);
+        _b.undo_move();
+        if (_aborted) return 0;
+        if (s > bestExcl) bestExcl = s;
+        if (bestExcl >= target) break;
+      }
+      if (bestExcl < target) singular = ttMove; // only the TT move holds
+    }
+
     for (final m in moves) {
       // Quiescence (budget exhausted): only captures/promotions, which
       // self-limit as material runs out; quiet checks would chain unboundedly.
       if (atLeaf && (m.flags & tacticalMask) == 0) continue;
       _b.make_move(m);
-      final forcing = inCheck || _isForcing(m, _b.king_attacked(_b.turn));
+      var forcing = inCheck || _isForcing(m, _b.king_attacked(_b.turn));
+      if (singular != null &&
+          m.from == singular.from &&
+          m.to == singular.to) {
+        forcing = true; // singular (forced) move extends for free
+      }
       final cost = forcing ? 0 : (1 + ply ~/ _quietStep);
       final score = -_negamaxC(budget - cost, -beta, -alpha, ply + 1);
       _b.undo_move();
