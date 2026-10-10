@@ -60,6 +60,9 @@ class AlphaBeta {
   static const int _maxPly = 64;
   int _plyCap = _maxPly; // forcing-extension depth cap for the current budget
   bool cxVerbose = false; // log the complexity ID progression
+  // Quiet-move cost grows with depth: 1 near the root, more deeper, so long
+  // quiet sequences are budget-prohibitive (loose at root, tight with depth).
+  static const int _quietStep = 2;
 
   AlphaBeta(
       {Map<int, _Tt>? sharedTt,
@@ -420,8 +423,8 @@ class AlphaBeta {
       if (atLeaf && (m.flags & tacticalMask) == 0) continue;
       _b.make_move(m);
       final forcing = inCheck || _isForcing(m, _b.king_attacked(_b.turn));
-      final score =
-          -_negamaxC(budget - (forcing ? 0 : 1), -beta, -alpha, ply + 1);
+      final cost = forcing ? 0 : (1 + ply ~/ _quietStep);
+      final score = -_negamaxC(budget - cost, -beta, -alpha, ply + 1);
       _b.undo_move();
       if (_aborted) return 0;
       if (score > best) {
