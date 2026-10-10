@@ -23,6 +23,7 @@ Future<void> main(List<String> args) async {
   var workers = 1;
   var useAb = false;
   var abCx = false; // use the complexity-budget AB search in the worker
+  var abPv = false; // expand the AB principal variation into the MCTS tree
   String? net;
   final files = <String>[];
   for (var i = 0; i < args.length; i++) {
@@ -39,6 +40,8 @@ Future<void> main(List<String> args) async {
         useAb = true;
       case '--abcx':
         abCx = true;
+      case '--abpv':
+        abPv = true;
       case '--net':
         net = args[++i];
       default:
@@ -133,6 +136,14 @@ Future<void> main(List<String> args) async {
             final inj = abInjection(info);
             if (inj != null) {
               mcts.injectAb(info.fen, inj.value, inj.weight);
+            }
+          }
+          // AB-guided MCTS: expand the root's AB principal variation into the
+          // tree so the net evaluates the AB-critical line.
+          if (abPv) {
+            final rootInfo = infos.isNotEmpty ? infos.first : null;
+            if (rootInfo != null && rootInfo.pv.isNotEmpty) {
+              await mcts.focusPvAsync(rootInfo.pv);
             }
           }
         }

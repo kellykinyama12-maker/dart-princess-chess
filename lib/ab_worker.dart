@@ -37,7 +37,8 @@ class AbInfo {
   final int scoreCp; // side-to-move POV
   final int depth;
   final bool mate;
-  AbInfo(this.fen, this.bestUci, this.scoreCp, this.depth, this.mate);
+  final List<String> pv; // principal variation (absolute UCI)
+  AbInfo(this.fen, this.bestUci, this.scoreCp, this.depth, this.mate, this.pv);
 }
 
 /// One isolate running a persistent [AlphaBeta] (its transposition table grows
@@ -59,7 +60,7 @@ class AbWorker {
       final infos = [
         for (final r in rows)
           AbInfo(r[0] as String, r[1] as String?, r[2] as int, r[3] as int,
-              r[4] as bool)
+              r[4] as bool, (r[5] as List).cast<String>())
       ];
       _pending.remove(id)?.complete(infos);
     });
@@ -118,7 +119,7 @@ void _abMain(List args) {
       final slice = (i == 0 ? per * 2 : per).clamp(5, budgetMs);
       final r = ab.search(fens[i],
           time: Duration(milliseconds: slice), rootPriors: priors[i]);
-      rows.add([fens[i], r.bestUci, r.scoreCp, r.depth, r.isMate]);
+      rows.add([fens[i], r.bestUci, r.scoreCp, r.depth, r.isMate, r.pv]);
     }
     reply.send([id, rows]);
   });

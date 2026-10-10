@@ -524,6 +524,44 @@ class Mcts {
     }
   }
 
+  /// AB-guided expansion: walks the alpha-beta principal variation [pvUci] from
+  /// the current root, creating/expanding each node with the net, and backs the
+  /// net value of the deepest reached node up that line. Injects the net's
+  /// evaluation of the AB-critical line into the MCTS tree as one visit.
+  Future<void> focusPvAsync(List<String> pvUci) async {
+    final root = _root;
+    final p = pool;
+    if (root == null || p == null || root.terminal) return;
+    final path = <_Node>[root];
+    var node = root;
+    for (final uci in pvUci) {
+      if (node.terminal) break;
+      if (node.children == null) {
+        final r = await p.expand(node.fen, node.stm, node.key);
+        if (node.children == null) _applyExpandResult(node, r);
+      }
+      final child = node.children?[uci];
+      if (child == null) break; // PV move not legal in the tree
+      node = child;
+      path.add(node);
+    }
+    final double v;
+    if (node.terminal) {
+      v = node.terminalValue;
+    } else if (node.children == null) {
+      final r = await p.expand(node.fen, node.stm, node.key);
+      v = node.children == null ? _applyExpandResult(node, r) : node.q;
+    } else {
+      v = node.q;
+    }
+    final last = path.length - 1;
+    for (var i = last; i >= 0; i--) {
+      final sign = ((last - i) % 2 == 0) ? 1.0 : -1.0;
+      path[i].visits++;
+      path[i].valueSum += v * sign;
+    }
+  }
+
   /// Expands [node] synchronously using the in-process evaluator.
   double _expand(_Node node) {
     final prep = _prepareExpand(node);
