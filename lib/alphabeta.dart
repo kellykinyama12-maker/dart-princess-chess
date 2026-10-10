@@ -162,6 +162,27 @@ class AlphaBeta {
 
     if (depth <= 0) return _quiesce(alpha, beta, ply);
 
+    final inCheck = _b.king_attacked(_b.turn);
+
+    // Null move pruning: if handing the opponent a free move still fails high,
+    // the position is good enough to cut off. Skipped when in check or with no
+    // non-pawn material (zugzwang risk), and only for real (non-mate) bounds.
+    if (!inCheck &&
+        depth >= 3 &&
+        beta.abs() < mateScore - 1000 &&
+        _hasNonPawnMaterial(_b.turn)) {
+      final r = 2 + (depth >= 6 ? 1 : 0);
+      final savedTurn = _b.turn;
+      final savedEp = _b.ep_square;
+      _b.turn = savedTurn == ch.Chess.WHITE ? ch.Chess.BLACK : ch.Chess.WHITE;
+      _b.ep_square = ch.Chess.EMPTY;
+      final score = -_negamax(depth - 1 - r, -beta, -beta + 1, ply + 1);
+      _b.turn = savedTurn;
+      _b.ep_square = savedEp;
+      if (_aborted) return 0;
+      if (score >= beta) return beta;
+    }
+
     final moves = _b.generate_moves();
     if (moves.isEmpty) {
       // No legal moves: checkmate (bad) or stalemate (draw).
@@ -169,7 +190,6 @@ class AlphaBeta {
     }
     _order(moves, ttMove);
 
-    final inCheck = _b.king_attacked(_b.turn);
     final origAlpha = alpha;
     var best = -_inf;
     ch.Move? bestMove;
@@ -223,6 +243,22 @@ class AlphaBeta {
     final uci = m.fromAlgebraic + m.toAlgebraic + (m.promotion?.name ?? '');
     final p = priors[uci];
     return p != null && p >= 0.05;
+  }
+
+  /// Whether [c] has any non-pawn, non-king material (knight/bishop/rook/queen),
+  /// used to gate null move pruning against zugzwang in pawn endings.
+  bool _hasNonPawnMaterial(ch.Color c) {
+    for (var i = ch.Chess.SQUARES_A8; i <= ch.Chess.SQUARES_H1; i++) {
+      if ((i & 0x88) != 0) {
+        i += 7;
+        continue;
+      }
+      final p = _b.board[i];
+      if (p == null || p.color != c) continue;
+      final t = p.type.shift;
+      if (t >= 1 && t <= 4) return true; // knight..queen
+    }
+    return false;
   }
 
   /// Capture/promotion-only search to a quiet position (avoids horizon tactics).
