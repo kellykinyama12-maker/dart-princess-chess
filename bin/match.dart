@@ -234,21 +234,18 @@ String? _applyUci(ch.Chess board, String uci) {
   final from = uci.substring(0, 2);
   final to = uci.substring(2, 4);
   final promo = uci.length > 4 ? uci[4].toLowerCase() : null;
-  Map? match;
-  for (final mv in board.moves({'verbose': true}) as List) {
-    final m = mv as Map;
-    final mp = m['promotion']?.toString().toLowerCase();
-    if (m['from'] == from && m['to'] == to && mp == promo) {
-      match = m;
-      break;
+  // chess 0.8.1's verbose map omits promotion; match on the Move object.
+  for (final mv in board.moves({'asObjects': true}) as List) {
+    final m = mv as ch.Move;
+    if (m.fromAlgebraic == from &&
+        m.toAlgebraic == to &&
+        m.promotion?.name == promo) {
+      final san = board.move_to_san(m);
+      board.move(m);
+      return san;
     }
   }
-  if (match == null) return null;
-  final san = match['san'] as String;
-  final mm = <String, dynamic>{'from': from, 'to': to};
-  if (promo != null) mm['promotion'] = promo;
-  board.move(mm);
-  return san;
+  return null;
 }
 
 void _addOpt(Map<String, String> opts, String kv) {

@@ -18,19 +18,16 @@ BoardExpansion expandBoard(String fen) {
   if (board.game_over) {
     return BoardExpansion(true, board.in_checkmate, const [], const []);
   }
-  final verbose = board.moves({'verbose': true}) as List;
+  final verbose = board.moves({'asObjects': true}) as List;
   final legal = <String>[];
   final childFens = <String>[];
   for (final mv in verbose) {
-    final m = mv as Map;
-    final from = m['from'] as String;
-    final to = m['to'] as String;
-    final promo = m['promotion'];
-    final uci = from + to + (promo != null ? promo.toString().toLowerCase() : '');
+    final m = mv as ch.Move;
+    // chess 0.8.1's verbose map omits the promotion field, so read it off the
+    // Move object (PieceType.name is 'q'/'r'/'b'/'n').
+    final uci = m.fromAlgebraic + m.toAlgebraic + (m.promotion?.name ?? '');
     final child = ch.Chess.fromFEN(fen);
-    final moveMap = <String, dynamic>{'from': from, 'to': to};
-    if (promo != null) moveMap['promotion'] = promo;
-    child.move(moveMap);
+    child.move(m);
     legal.add(uci);
     childFens.add(child.fen);
   }

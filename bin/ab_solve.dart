@@ -38,14 +38,10 @@ void main(List<String> args) {
       final board = ch.Chess.fromFEN(p.fen);
       final uciToSan = <String, String>{};
       final sanToUci = <String, String>{};
-      for (final mv in board.moves({'verbose': true}) as List) {
-        final m = mv as Map;
-        final uci = (m['from'] as String) +
-            (m['to'] as String) +
-            (m['promotion'] != null
-                ? m['promotion'].toString().toLowerCase()
-                : '');
-        final san = _norm(m['san'] as String);
+      for (final mv in board.moves({'asObjects': true}) as List) {
+        final m = mv as ch.Move;
+        final uci = m.fromAlgebraic + m.toAlgebraic + (m.promotion?.name ?? '');
+        final san = _norm(board.move_to_san(m));
         uciToSan[uci] = san;
         sanToUci[san] = uci;
       }
