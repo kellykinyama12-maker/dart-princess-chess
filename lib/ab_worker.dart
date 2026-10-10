@@ -4,6 +4,7 @@ import 'dart:math' as math;
 
 import 'mcts.dart' show MoveStat;
 import 'alphabeta.dart';
+import 'nnue.dart';
 
 /// AB value (position side-to-move POV) and weight to transfer into the MCTS
 /// transposition table, or null to leave a quiet position to the net.
@@ -66,9 +67,11 @@ class AbWorker {
     });
   }
 
-  static Future<AbWorker> start({bool complexity = false}) async {
+  static Future<AbWorker> start(
+      {bool complexity = false, String? nnuePath}) async {
     final ready = ReceivePort();
-    final iso = await Isolate.spawn(_abMain, [ready.sendPort, complexity]);
+    final iso =
+        await Isolate.spawn(_abMain, [ready.sendPort, complexity, nnuePath]);
     final send = await ready.first as SendPort;
     ready.close();
     return AbWorker._(iso, send, ReceivePort());
@@ -98,7 +101,10 @@ class AbWorker {
 void _abMain(List args) {
   final ready = args[0] as SendPort;
   final complexity = args[1] as bool;
-  final ab = AlphaBeta(complexity: complexity); // persistent transposition table
+  final nnuePath = args.length > 2 ? args[2] as String? : null;
+  final nnue = nnuePath != null ? Nnue.load(nnuePath) : null;
+  final ab = AlphaBeta(
+      complexity: complexity, nnue: nnue); // persistent transposition table
   final port = ReceivePort();
   ready.send(port.sendPort);
   port.listen((msg) {

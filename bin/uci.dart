@@ -43,6 +43,7 @@ class _Engine {
   bool ponderEnabled = false;
   bool useAb = true; // run the alpha-beta tactical worker alongside MCTS
   bool useTT = true; // share MCTS stats across transposing positions
+  String abNnuePath = ''; // NNUE net for the AB worker (empty = material+PST)
   String weightsPath = _resolveWeights();
 
   EvalPool? _pool;
@@ -72,6 +73,7 @@ class _Engine {
         _out('option name Ponder type check default false');
         _out('option name UseAB type check default true');
         _out('option name UseTT type check default true');
+        _out('option name AbNnue type string default');
         _out('option name WeightsFile type string default $weightsPath');
         _out('uciok');
       case 'isready':
@@ -134,6 +136,11 @@ class _Engine {
           useTT = v;
           _disposeEngine();
         }
+      case 'abnnue':
+        if (value != abNnuePath) {
+          abNnuePath = value;
+          _disposeEngine();
+        }
       case 'weightsfile':
         if (value.isNotEmpty && value != weightsPath) {
           weightsPath = value;
@@ -155,7 +162,10 @@ class _Engine {
           batchSize: threads * 2,
           transpositions: useTT,
           addRootNoise: false);
-      if (useAb) _ab = await AbWorker.start();
+      if (useAb) {
+        _ab = await AbWorker.start(
+            nnuePath: abNnuePath.isNotEmpty ? abNnuePath : null);
+      }
     } else {
       final evaluator = Lc0Evaluator.load(weightsPath);
       _mcts = Mcts(evaluator,

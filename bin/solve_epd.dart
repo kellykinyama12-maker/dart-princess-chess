@@ -25,6 +25,7 @@ Future<void> main(List<String> args) async {
   var abCx = false; // use the complexity-budget AB search in the worker
   var abPv = false; // expand the AB principal variation into the MCTS tree
   var abShare = false; // share MCTS net priors into AB interior move ordering
+  String? abNnue; // NNUE net for the AB worker's eval
   String? net;
   final files = <String>[];
   for (var i = 0; i < args.length; i++) {
@@ -45,6 +46,8 @@ Future<void> main(List<String> args) async {
         abPv = true;
       case '--abshare':
         abShare = true;
+      case '--abnnue':
+        abNnue = args[++i];
       case '--net':
         net = args[++i];
       default:
@@ -84,7 +87,8 @@ Future<void> main(List<String> args) async {
     mcts = Mcts(Lc0Evaluator.load(weightsPath), addRootNoise: false);
   }
 
-  final ab = useAb ? await AbWorker.start(complexity: abCx) : null;
+  final ab =
+      useAb ? await AbWorker.start(complexity: abCx, nnuePath: abNnue) : null;
 
   final budget = movetime != null
       ? 'movetime ${movetime}ms'
