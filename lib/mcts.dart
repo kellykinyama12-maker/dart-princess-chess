@@ -524,25 +524,27 @@ class Mcts {
     }
   }
 
-  /// AB-guided expansion: walks the alpha-beta principal variation [pvUci] from
-  /// the current root, creating/expanding each node with the net, and backs the
-  /// net value of the deepest reached node up that line. Injects the net's
-  /// evaluation of the AB-critical line into the MCTS tree as one visit.
+  /// AB-guided expansion: descends following the alpha-beta PV [pvUci] while it
+  /// lasts, then switches to normal PUCT selection (MCTS reaches deeper than
+  /// AB), expands the leaf with the net, and backs its value up the line.
   Future<void> focusPvAsync(List<String> pvUci) async {
     final root = _root;
     final p = pool;
     if (root == null || p == null || root.terminal) return;
     final path = <_Node>[root];
     var node = root;
-    for (final uci in pvUci) {
-      if (node.terminal) break;
-      if (node.children == null) {
-        final r = await p.expand(node.fen, node.stm, node.key);
-        if (node.children == null) _applyExpandResult(node, r);
+    var pvIdx = 0;
+    while (!node.terminal &&
+        node.children != null &&
+        node.children!.isNotEmpty) {
+      _Node? next;
+      if (pvIdx < pvUci.length) {
+        next = node.children![pvUci[pvIdx]]; // follow AB PV
+        pvIdx++;
       }
-      final child = node.children?[uci];
-      if (child == null) break; // PV move not legal in the tree
-      node = child;
+      next ??= _selectChildPuct(node); // beyond the PV: normal MCTS selection
+      if (next == null) break;
+      node = next;
       path.add(node);
     }
     final double v;
@@ -560,6 +562,33 @@ class Mcts {
       path[i].visits++;
       path[i].valueSum += v * sign;
     }
+  }
+
+  /// PUCT-best child of [node] (no virtual loss applied), or null if a leaf.
+  _Node? _selectChildPuct(_Node node) {
+    final children = node.children;
+    if (children == null || children.isEmpty) return null;
+    final parentVisits = node.visits + node.vloss;
+    final parentQ = node.q;
+    _Node? best;
+    var bestScore = double.negativeInfinity;
+    children.forEach((_, child) {
+      final cv = child.visits + child.vloss;
+      final abW = child.abWeight;
+      final denom = cv + abW;
+      final effQ = denom > 0
+          ? (child.valueSum + child.vloss + abW * child.abValue) / denom
+          : 0.0;
+      final exploit = denom > 0 ? -effQ : (parentQ - fpuReduction);
+      final explore =
+          cPuct * child.prior * math.sqrt(parentVisits + 1) / (1 + cv);
+      final score = exploit + explore;
+      if (score > bestScore) {
+        bestScore = score;
+        best = child;
+      }
+    });
+    return best;
   }
 
   /// Expands [node] synchronously using the in-process evaluator.
