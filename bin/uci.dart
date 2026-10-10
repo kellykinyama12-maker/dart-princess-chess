@@ -299,6 +299,10 @@ class _Engine {
               _mcts!.injectAb(info.fen, inj.value, inj.weight);
             }
           }
+          // AB-guided MCTS: seed the tree with the root's AB principal variation.
+          if (infos.isNotEmpty && infos.first.pv.isNotEmpty) {
+            await _mcts!.focusPvAsync(infos.first.pv);
+          }
         }
       }
 
