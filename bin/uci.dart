@@ -176,6 +176,7 @@ class _Engine {
     _pool = null;
     _ab?.dispose();
     _ab = null;
+    _mcts?.dispose();
     _mcts = null;
   }
 

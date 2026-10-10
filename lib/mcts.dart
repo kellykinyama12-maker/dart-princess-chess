@@ -4,6 +4,7 @@ import 'dart:math' as math;
 import 'package:chess/chess.dart' as ch;
 
 import 'alphabeta.dart';
+import 'ab_worker.dart';
 import 'board_expand.dart';
 import 'eval_pool.dart';
 import 'lc0_evaluator.dart';
@@ -86,6 +87,12 @@ class Mcts {
   // unified rollout. Depth per position is iteratively deepened, capped here.
   static const int _abMaxDepth = 10;
   AlphaBeta _abSearcher = AlphaBeta();
+
+  // Off-main-isolate AB searcher for the pooled/async rollout, so alpha-beta
+  // runs concurrently with the net evaluations in flight (spawned lazily the
+  // first time an AB leaf appears, kept across searches for TT reuse).
+  AbWorker? _abWorker;
+  Future<AbWorker>? _abWorkerStarting;
 
   _Node? _root; // persisted across searches to enable tree reuse
   final Map<int, _Stats> _tt = {}; // Zobrist key -> shared stats
@@ -176,6 +183,13 @@ class Mcts {
     _root = null;
     _tt.clear();
     _abSearcher = AlphaBeta();
+  }
+
+  /// Releases the rollout AB worker isolate, if one was spawned.
+  void dispose() {
+    _abWorker?.dispose();
+    _abWorker = null;
+    _abWorkerStarting = null;
   }
 
   /// Stat transfer from alpha-beta: records [value] (position side-to-move POV,
@@ -331,18 +345,23 @@ class Mcts {
   }
 
   /// Collects [count] leaves (virtual loss), expands the unique unexpanded ones
-  /// concurrently on the pool, then backs the values up.
+  /// concurrently on the pool, then backs the values up. AB-selected leaves are
+  /// searched on a worker isolate in parallel, so alpha-beta compute overlaps
+  /// the net evaluations instead of blocking the main isolate.
   Future<void> _runBatchAsync(_Node root, int count) async {
     final rollouts = <(List<_Node>, int)>[];
     for (var b = 0; b < count; b++) {
       rollouts.add(_collectLeafAb(root));
     }
     final values = <_Node, double>{};
-    final leaves = <_Node>[];
+    final leaves = <_Node>[]; // unique net leaves to expand on the pool
+    final abLeaves = <_Node>[]; // unique AB leaves to search on the worker
     for (final (path, abDepth) in rollouts) {
       final leaf = path.last;
       if (abDepth > 0 && !leaf.terminal) {
-        values[leaf] = _abEval(leaf, abDepth); // embedded alpha-beta
+        if (!values.containsKey(leaf) && !abLeaves.contains(leaf)) {
+          abLeaves.add(leaf);
+        }
         continue;
       }
       if (values.containsKey(leaf) || leaf.children != null) {
@@ -351,14 +370,40 @@ class Mcts {
       }
       if (!leaves.contains(leaf)) leaves.add(leaf);
     }
-    final results = await Future.wait(
+    // Launch net and alpha-beta concurrently; await both.
+    final nnFuture = Future.wait(
         [for (final leaf in leaves) pool!.expand(leaf.fen, leaf.stm, leaf.key)]);
+    Future<List<AbInfo>>? abFuture;
+    if (abLeaves.isNotEmpty) {
+      final worker = await _ensureAbWorker();
+      abFuture = worker.rollout(
+          [for (final l in abLeaves) l.fen],
+          [for (final l in abLeaves) l.abDepth],
+          30);
+    }
+    final results = await nnFuture;
     for (var i = 0; i < leaves.length; i++) {
       values[leaves[i]] = _applyExpandResult(leaves[i], results[i]);
+    }
+    if (abFuture != null) {
+      final infos = await abFuture;
+      for (var i = 0; i < abLeaves.length; i++) {
+        values[abLeaves[i]] = _abInfoValue(infos[i]);
+      }
     }
     for (final (path, _) in rollouts) {
       _backup(path, values[path.last] ?? path.last.terminalValue);
     }
+  }
+
+  /// Returns the rollout AB worker, spawning it once on first use.
+  Future<AbWorker> _ensureAbWorker() {
+    final w = _abWorker;
+    if (w != null) return Future.value(w);
+    return _abWorkerStarting ??= AbWorker.start().then((worker) {
+      _abWorker = worker;
+      return worker;
+    });
   }
 
   /// Attaches children (or marks terminal) from a worker [ExpandResult] and
@@ -508,8 +553,11 @@ class Mcts {
     while (!node.terminal &&
         node.children != null &&
         node.children!.isNotEmpty) {
+      // Only an MCTS-visited (expanded) node may be handed to alpha-beta; a node
+      // that merely has children via a transposition isn't a valid AB leaf yet.
       if (abProb > 0 &&
           !identical(node, root) &&
+          node.visits > 0 &&
           _rng.nextDouble() < abProb) {
         final d = (node.abDepth + 1).clamp(1, _abMaxDepth);
         node.abDepth = d;
@@ -544,12 +592,21 @@ class Mcts {
     return (path, 0);
   }
 
-  /// Embedded alpha-beta value of [node] to [depth] (position STM POV, [-1,1]).
+  /// Embedded alpha-beta value of [node] to [depth] (position STM POV, [-1,1]),
+  /// run inline (used by the single-threaded path).
   double _abEval(_Node node, int depth) {
     final r = _abSearcher.search(node.fen,
         maxDepth: depth, time: const Duration(milliseconds: 30));
-    if (r.isMate) return r.scoreCp > 0 ? 1.0 : -1.0;
-    final x = r.scoreCp / 400.0;
+    return _abScoreValue(r.scoreCp, r.isMate);
+  }
+
+  /// Converts an alpha-beta result from the rollout worker to a node-POV value.
+  double _abInfoValue(AbInfo r) => _abScoreValue(r.scoreCp, r.mate);
+
+  /// Maps an alpha-beta centipawn score (STM POV) to a [-1,1] value.
+  double _abScoreValue(int scoreCp, bool mate) {
+    if (mate) return scoreCp > 0 ? 1.0 : -1.0;
+    final x = scoreCp / 400.0;
     if (x > 20) return 1.0;
     if (x < -20) return -1.0;
     final e = math.exp(2 * x);

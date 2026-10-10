@@ -171,6 +171,7 @@ Future<void> main(List<String> args) async {
       'avg ${(totalMs / puzzles.length).toStringAsFixed(0)} ms/pos');
   pool?.dispose();
   ab?.dispose();
+  mcts.dispose();
 }
 
 Duration? _dur(int? ms) => ms == null ? null : Duration(milliseconds: ms);
