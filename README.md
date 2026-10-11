@@ -135,6 +135,20 @@ dart run bin/searchless_test.dart
 # startpos -> e2e4 53.4%, d2d4 53.0%, g1f3 52.5% ...
 ```
 
+**Speed — optional OpenBLAS fast path.** The transformer matmuls use OpenBLAS
+`sgemm` when a BLAS library is available, otherwise a pure-Dart `Float32x4`
+kernel (bit-identical output, slower). Point `DART_PYTORCH_BLAS` at any OpenBLAS
+dll/so (numpy/scipy ship one) and keep one BLAS thread per isolate:
+
+```powershell
+$env:DART_PYTORCH_BLAS   = 'C:\...\numpy.libs\libscipy_openblas64_-....dll'
+$env:OPENBLAS_NUM_THREADS = '1'
+dart run bin/searchless_uci.dart
+```
+
+Measured **~6× speedup** on the 9M (single-thread **~238 → ~42 ms/move**, same
+moves). This is also what makes 270M practical (~7 → ~1.2 s/move single-thread).
+
 ### 3. Bigger models (136M / 270M — one-time offline Python)
 
 DeepMind only publishes these in Orbax format, so convert once to npz. This is the

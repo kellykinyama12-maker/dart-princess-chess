@@ -13,6 +13,7 @@ import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 import 'package:chess/chess.dart' as ch;
+import 'package:dart_pytorch/core/tensor/blas.dart' show Blas;
 
 // ---------------------------------------------------------------------------
 // npz / npy parsing
@@ -253,9 +254,18 @@ Map<String, int> _buildMoveToAction() {
 // Transformer weights + forward
 // ---------------------------------------------------------------------------
 
-/// SIMD `out[T,N] += X[T,K] @ W[K,N]` (W row-major, out pre-zeroed).
-void _matmulAcc(Float32List x, int t, int k, Float32List w, int n,
+/// `out[T,N] = X[T,K] @ W[K,N]` (W row-major). Uses OpenBLAS sgemm when
+/// available (set `DART_PYTORCH_BLAS` to an OpenBLAS dll/so), otherwise a
+/// Float32x4 SIMD kernel.
+void _matmul(Float32List x, int t, int k, Float32List w, int n,
     Float32List out) {
+  if (Blas.enabled) {
+    Blas.sgemm(x, w, out, t, k, n);
+    return;
+  }
+  for (var i = 0; i < out.length; i++) {
+    out[i] = 0.0;
+  }
   final wv = Float32x4List.view(w.buffer, w.offsetInBytes, w.length >> 2);
   final ov = Float32x4List.view(out.buffer, out.offsetInBytes, out.length >> 2);
   final n4 = n >> 2;
@@ -451,9 +461,9 @@ class SearchlessNet {
     final q = Float32List(t * dim);
     final k = Float32List(t * dim);
     final v = Float32List(t * dim);
-    _matmulAcc(x, t, dim, wq[layer], dim, q);
-    _matmulAcc(x, t, dim, wk[layer], dim, k);
-    _matmulAcc(x, t, dim, wv[layer], dim, v);
+    _matmul(x, t, dim, wq[layer], dim, q);
+    _matmul(x, t, dim, wk[layer], dim, k);
+    _matmul(x, t, dim, wv[layer], dim, v);
     final scale = 1.0 / math.sqrt(headDim.toDouble());
     final ctx = Float32List(t * dim); // concat heads
     final scores = Float32List(t);
@@ -489,20 +499,20 @@ class SearchlessNet {
         }
       }
     }
-    _matmulAcc(ctx, t, dim, wo[layer], dim, out);
+    _matmul(ctx, t, dim, wo[layer], dim, out);
   }
 
   void _mlp(Float32List x, int t, int layer, Float32List out) {
     final s1 = Float32List(t * ffn);
     final s2 = Float32List(t * ffn);
-    _matmulAcc(x, t, dim, w1[layer], ffn, s1);
-    _matmulAcc(x, t, dim, w2[layer], ffn, s2);
+    _matmul(x, t, dim, w1[layer], ffn, s1);
+    _matmul(x, t, dim, w2[layer], ffn, s2);
     // SwiGLU: silu(s1) * s2
     for (var i = 0; i < s1.length; i++) {
       final a = s1[i];
       s1[i] = (a / (1.0 + math.exp(-a))) * s2[i];
     }
-    _matmulAcc(s1, t, ffn, w3[layer], dim, out);
+    _matmul(s1, t, ffn, w3[layer], dim, out);
   }
 
   /// Runs the model on a token sequence (length [maxSeq]) and returns the 128
@@ -550,10 +560,10 @@ class SearchlessNet {
       last[d] = h[loff + d];
     }
     final logits = Float32List(buckets);
+    _matmul(last, 1, dim, wLogits, buckets, logits);
     for (var b = 0; b < buckets; b++) {
-      logits[b] = bLogits[b];
+      logits[b] += bLogits[b];
     }
-    _matmulAcc(last, 1, dim, wLogits, buckets, logits);
     return logits;
   }
 }

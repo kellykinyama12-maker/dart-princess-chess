@@ -1,9 +1,11 @@
 import 'dart:io';
 
 import 'package:chess_moves/searchless.dart';
+import 'package:dart_pytorch/core/tensor/blas.dart' show Blas;
 
 void main(List<String> args) {
   final npz = args.isNotEmpty ? args[0] : 'models/searchless/params.npz';
+  stdout.writeln(Blas.status());
   stdout.writeln('Loading $npz ...');
   var sw = Stopwatch()..start();
   final engine = SearchlessEngine.load(npz);
