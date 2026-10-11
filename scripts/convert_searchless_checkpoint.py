@@ -46,13 +46,23 @@ def find_params_dir(ckpt_root: pathlib.Path) -> pathlib.Path:
 
 
 def restore(params_dir: pathlib.Path):
-    """Restores an Orbax PyTree checkpoint to a nested dict of numpy arrays."""
+    """Restores an Orbax PyTree checkpoint to a nested dict of numpy arrays.
+
+    Reads the checkpoint metadata to build per-leaf restore args that pull every
+    array onto the host as a plain ``np.ndarray`` (no jax sharding needed).
+    """
     params_dir = params_dir.resolve()
     handler = ocp.PyTreeCheckpointHandler()
+    meta = handler.metadata(params_dir)
+    restore_args = jax.tree_util.tree_map(
+        lambda _: ocp.RestoreArgs(restore_type=np.ndarray), meta
+    )
     try:
-        return handler.restore(params_dir)
-    except Exception:  # noqa: BLE001 - newer orbax needs an explicit args object
-        return handler.restore(params_dir, args=ocp.args.PyTreeRestore())
+        return handler.restore(params_dir, restore_args=restore_args)
+    except TypeError:  # older/newer signature: wrap in an args object
+        return handler.restore(
+            params_dir, args=ocp.args.PyTreeRestore(restore_args=restore_args)
+        )
 
 
 def main() -> None:

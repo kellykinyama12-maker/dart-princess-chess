@@ -152,20 +152,41 @@ moves). This is also what makes 270M practical (~7 → ~1.2 s/move single-thread
 ### 3. Bigger models (136M / 270M — one-time offline Python)
 
 DeepMind only publishes these in Orbax format, so convert once to npz. This is the
-**only** Python and it runs offline — inference stays pure Dart:
+**only** Python and it runs offline — inference stays pure Dart. On Windows,
+pin an **older** `orbax-checkpoint` (newer ones fail to unpack under `MAX_PATH`):
 
 ```powershell
-pip install "jax[cpu]" orbax-checkpoint numpy
+pip install "jax[cpu]" "orbax-checkpoint==0.5.23" numpy
 # download + unzip https://storage.googleapis.com/searchless_chess/checkpoints/270M.zip
 python scripts/convert_searchless_checkpoint.py --ckpt ./270M --out params_270M.npz
-dart run bin/searchless_uci.dart   # setoption name WeightsFile value params_270M.npz
 ```
 
-The loader auto-detects model size (`dim`, layers) from the npz. ⚠️ 270M is ~32×
-the 9M compute (~10–15 s/move in pure Dart) — practical only with a faster matmul
-backend (BLAS/GPU).
+The loader auto-detects `dim`/layers from the npz. The 270M weights are ~1 GB
+**per isolate**, so lower the worker count to bound RAM, and enable BLAS:
 
-### 4. Experimental hybrid
+```powershell
+$env:DART_PYTORCH_BLAS = '...openblas...dll'; $env:OPENBLAS_NUM_THREADS = '1'
+dart run bin/searchless_uci.dart
+# setoption name WeightsFile value params_270M.npz
+# setoption name Workers value 6     # ~6 GB RAM, ~1–2 s/move with BLAS
+```
+
+Verified end-to-end: 270M loads (182 arrays, **dim 1024 × 16 layers**) and plays
+correctly (`e4` 54%, mates found). Without BLAS it is ~16× slower.
+
+### 4. Stronger play — 2-ply search
+
+[`bin/searchless_2ply_uci.dart`](bin/searchless_2ply_uci.dart) wraps the net in a
+depth-1 minimax: it takes the top-`TopK` moves by the net's win probability,
+plays each, and lets the net pick the opponent's best reply — scoring a move by
+`1 − max(opponent win prob)`. This is the search the paper shows improves on the
+raw amortized policy. Fast with BLAS (~2–3 s/move at `TopK=10`).
+
+> **Result vs lc0** (8 games, opening book [`openings.epd`](openings.epd),
+> 800 ms/move): **+0 =6 −2 (37.5%)** — holds lc0 to draws far more often than the
+> raw 1-ply net (~25%), fixing several losses into draws.
+
+### 5. Experimental hybrid
 
 [`bin/searchless_hybrid_uci.dart`](bin/searchless_hybrid_uci.dart) runs the net as
 the strategic chooser with a shallow NNUE alpha-beta as a *blunder veto*. In
@@ -179,10 +200,12 @@ experiment (`AbMs`, `MarginCp`, `VetoFloorCp`).
 |---|---|
 | [`lib/searchless.dart`](lib/searchless.dart) | npz/npy loader, FEN tokenizer, 1968-move action map, SIMD transformer forward, action-value engine |
 | [`lib/searchless_pool.dart`](lib/searchless_pool.dart) | Isolate pool: parallel per-move scoring, full win-prob map + best move |
-| [`bin/searchless_uci.dart`](bin/searchless_uci.dart) | **UCI engine (standalone net — strongest)** |
+| [`bin/searchless_uci.dart`](bin/searchless_uci.dart) | **UCI engine (standalone net — strongest single-pass)** |
+| [`bin/searchless_2ply_uci.dart`](bin/searchless_2ply_uci.dart) | UCI engine: depth-1 minimax using the net as the leaf evaluator (37.5% vs lc0) |
 | [`bin/searchless_hybrid_uci.dart`](bin/searchless_hybrid_uci.dart) | Experimental net + alpha-beta blunder-veto hybrid |
 | [`bin/searchless_test.dart`](bin/searchless_test.dart) | Smoke test (prints ranked moves + timing) |
 | [`scripts/convert_searchless_checkpoint.py`](scripts/convert_searchless_checkpoint.py) | One-time offline Orbax → npz converter for 136M / 270M |
+| [`openings.epd`](openings.epd) | Small varied-opening book for the match runner |
 
 ---
 
