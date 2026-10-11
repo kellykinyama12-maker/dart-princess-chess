@@ -275,27 +275,34 @@ void _matmulAcc(Float32List x, int t, int k, Float32List w, int n,
 }
 
 class SearchlessNet {
-  static const int dim = 256;
-  static const int numLayers = 8;
-  static const int numHeads = 8;
-  static const int headDim = dim ~/ numHeads; // 32
-  static const int ffn = 1024;
   static const int buckets = 128;
   static const int maxSeq = 79;
+  static const int vocab = 1968;
   static const double _eps = 1e-5;
-  static final double _embScale = math.sqrt(dim.toDouble());
 
-  final Float32List tokEmb; // [1968, 256]
-  final Float32List posEmb; // [79, 256]
+  final int dim;
+  final int numLayers;
+  final int numHeads;
+  final int headDim;
+  final int ffn;
+  final double _embScale;
+
+  final Float32List tokEmb; // [vocab, dim]
+  final Float32List posEmb; // [maxSeq, dim]
   final List<Float32List> lnOffAttn, lnScaleAttn; // per layer
   final List<Float32List> lnOffMlp, lnScaleMlp; // per layer
   final Float32List lnOffFinal, lnScaleFinal;
-  final List<Float32List> wq, wk, wv, wo; // [256,256] each
-  final List<Float32List> w1, w2, w3; // [256,1024],[256,1024],[1024,256]
-  final Float32List wLogits; // [256,128]
-  final Float32List bLogits; // [128]
+  final List<Float32List> wq, wk, wv, wo; // [dim,dim] each
+  final List<Float32List> w1, w2, w3; // [dim,ffn],[dim,ffn],[ffn,dim]
+  final Float32List wLogits; // [dim,buckets]
+  final Float32List bLogits; // [buckets]
 
   SearchlessNet._({
+    required this.dim,
+    required this.numLayers,
+    required this.numHeads,
+    required this.headDim,
+    required this.ffn,
     required this.tokEmb,
     required this.posEmb,
     required this.lnOffAttn,
@@ -313,11 +320,17 @@ class SearchlessNet {
     required this.w3,
     required this.wLogits,
     required this.bLogits,
-  });
+  }) : _embScale = math.sqrt(dim.toDouble());
 
   /// Loads from a `params.npz`, resolving the jax sorted-key flatten order.
-  factory SearchlessNet.load(String npzPath) {
+  /// Model dimensions are auto-detected: `dim` from the token embedding and
+  /// `numLayers` from the array count (all released nets use 8 heads).
+  factory SearchlessNet.load(String npzPath, {int numHeads = 8}) {
     final arr = _loadNpz(npzPath);
+    final dim = arr[0].cols; // arr_0 = token embedding [vocab, dim]
+    final numLayers = (arr.length - 6) ~/ 11;
+    final ffn = dim * 4; // widening_factor = 4
+    final headDim = dim ~/ numHeads;
 
     // Rebuild the (module_key, param_name) -> arr_index mapping by replicating
     // jax.tree_util's deterministic sort of the Haiku params dict: lexicographic
@@ -326,14 +339,15 @@ class SearchlessNet {
     void add(String key, String param) => entries.add([key, param]);
     add('embed', 'embeddings'); // token embedding
     add('embed_1', 'embeddings'); // learned positional embedding
-    for (var i = 0; i < 17; i++) {
+    for (var i = 0; i < 2 * numLayers + 1; i++) {
       final key = i == 0 ? 'layer_norm' : 'layer_norm_$i';
       add(key, 'offset');
       add(key, 'scale');
     }
-    for (var i = 0; i < 25; i++) {
+    final finalLin = 3 * numLayers; // final logits linear index
+    for (var i = 0; i <= finalLin; i++) {
       final key = i == 0 ? 'linear' : 'linear_$i';
-      if (i == 24) add(key, 'b'); // final logits linear has bias
+      if (i == finalLin) add(key, 'b'); // final logits linear has bias
       add(key, 'w');
     }
     for (var m = 0; m < numLayers; m++) {
@@ -384,14 +398,19 @@ class SearchlessNet {
     }
 
     return SearchlessNet._(
+      dim: dim,
+      numLayers: numLayers,
+      numHeads: numHeads,
+      headDim: headDim,
+      ffn: ffn,
       tokEmb: w('embed', 'embeddings'),
       posEmb: w('embed_1', 'embeddings'),
       lnOffAttn: lnOffA,
       lnScaleAttn: lnScaleA,
       lnOffMlp: lnOffM,
       lnScaleMlp: lnScaleM,
-      lnOffFinal: w(_lnKey(16), 'offset'),
-      lnScaleFinal: w(_lnKey(16), 'scale'),
+      lnOffFinal: w(_lnKey(2 * numLayers), 'offset'),
+      lnScaleFinal: w(_lnKey(2 * numLayers), 'scale'),
       wq: wqs,
       wk: wks,
       wv: wvs,
@@ -399,8 +418,8 @@ class SearchlessNet {
       w1: w1s,
       w2: w2s,
       w3: w3s,
-      wLogits: w(_linKey(24), 'w'),
-      bLogits: w(_linKey(24), 'b'),
+      wLogits: w(_linKey(finalLin), 'w'),
+      bLogits: w(_linKey(finalLin), 'b'),
     );
   }
 

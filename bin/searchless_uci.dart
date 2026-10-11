@@ -1,76 +1,13 @@
-// UCI engine wrapping the DeepMind searchless-chess 9M action-value net.
+// UCI engine wrapping the DeepMind searchless-chess action-value net.
 // Pure Dart, no Python. Evaluates legal moves across an isolate pool.
 //   dart run bin/searchless_uci.dart
-import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:isolate';
 
 import 'package:chess/chess.dart' as ch;
-import 'package:chess_moves/searchless.dart';
+import 'package:chess_moves/searchless_pool.dart';
 
 const _startFen = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
-
-/// A pool of worker isolates, each holding its own copy of the net, that score
-/// disjoint slices of a position's legal moves in parallel.
-class SearchlessPool {
-  final List<SendPort> _workers;
-  SearchlessPool._(this._workers);
-
-  static Future<SearchlessPool> start(String npz, int workers) async {
-    final ports = <SendPort>[];
-    for (var i = 0; i < workers; i++) {
-      final ready = ReceivePort();
-      await Isolate.spawn(_worker, [ready.sendPort, npz]);
-      ports.add(await ready.first as SendPort);
-    }
-    return SearchlessPool._(ports);
-  }
-
-  Future<String?> bestMove(String fen) async {
-    final board = ch.Chess.fromFEN(fen);
-    final count = (board.moves({'asObjects': true}) as List).length;
-    if (count == 0) return null;
-    final n = _workers.length;
-    final chunk = (count + n - 1) ~/ n;
-    final futures = <Future<Map<String, double>>>[];
-    for (var i = 0; i < n; i++) {
-      final lo = i * chunk;
-      if (lo >= count) break;
-      final hi = (lo + chunk) < count ? (lo + chunk) : count;
-      final reply = ReceivePort();
-      _workers[i].send([reply.sendPort, fen, lo, hi]);
-      futures.add(reply.first.then((v) => (v as Map).cast<String, double>()));
-    }
-    final parts = await Future.wait(futures);
-    String? best;
-    var bestWin = double.negativeInfinity;
-    for (final p in parts) {
-      p.forEach((uci, win) {
-        if (win > bestWin) {
-          bestWin = win;
-          best = uci;
-        }
-      });
-    }
-    return best;
-  }
-
-  static void _worker(List init) {
-    final SendPort ready = init[0];
-    final String npz = init[1];
-    final engine = SearchlessEngine.load(npz);
-    final rp = ReceivePort();
-    ready.send(rp.sendPort);
-    rp.listen((msg) {
-      final SendPort reply = msg[0];
-      final String fen = msg[1];
-      final int lo = msg[2];
-      final int hi = msg[3];
-      reply.send(engine.evaluateRange(fen, lo, hi));
-    });
-  }
-}
 
 Future<void> main(List<String> args) async {
   var npzPath = 'models/searchless/params.npz';
