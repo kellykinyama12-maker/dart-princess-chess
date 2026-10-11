@@ -14,6 +14,10 @@ no GPU, no Python, no ONNX runtime.
 > notes live in [`docs/README.md`](docs/README.md)); it has since grown into a
 > full search engine around lc0's own networks.
 
+> 💡 **Strongest engine:** the pure-Dart port of DeepMind's **searchless-chess**
+> transformer (`bin/searchless_uci.dart`) is the best-performing engine here — the
+> only one to draw lc0. See [Searchless-chess engine](#searchless-chess-engine-strongest-so-far).
+
 ---
 
 ## What's inside
@@ -79,6 +83,92 @@ no GPU, no Python, no ONNX runtime.
   mates us in 20–55 plies. The net quality is identical; the gap is search
   throughput — which is exactly what the alpha-beta worker and the SIMD forward
   are chipping away at.
+
+---
+
+## Searchless-chess engine (strongest so far)
+
+A pure-Dart loader + UCI engine for DeepMind's **"searchless chess"** transformers
+([*Amortized Planning with Large-Scale Transformers*](https://arxiv.org/abs/2402.04494),
+NeurIPS 2024). These decoder-only transformers are trained by supervised learning
+on Stockfish-annotated positions and predict a **win probability for every legal
+move in a single forward pass — no search at all**. The released sizes reach
+~2000–2300 (9M) up to ~2700 Lichess blitz (270M).
+
+**No Python, no JAX, no GPU.** The weights load from a plain `params.npz` (a ZIP
+of `.npy` arrays) via the `archive` package, and the LLaMa-style decoder (learned
+token + positional embeddings, pre-LN blocks, SwiGLU MLP, post-LN, 128-bucket
+value head) runs on the CPU with a hand-rolled `Float32x4` SIMD forward. The npz
+array order is reconstructed by replicating jax's sorted-key pytree flatten.
+
+> **Result vs lc0** (conv `744706` 128×10, 800 ms/move): **+0 =2 −2 (25%)** — the
+> only engine in this repo to hold lc0 to draws. It plays sound, theoretical chess
+> (real Sicilians, no positional drift), picking moves purely from the net's
+> per-move win probabilities.
+
+### 1. Get the 9M weights (no Python)
+
+Download the npz mirror into `models/searchless/`:
+
+```powershell
+$b = 'https://huggingface.co/dbest-isi/searchless-chess-9M-selfplay/resolve/main'
+New-Item -ItemType Directory -Force models\searchless | Out-Null
+Invoke-WebRequest -UseBasicParsing "$b/params.npz?download=true" -OutFile models\searchless\params.npz
+```
+
+### 2. Run it (UCI)
+
+```powershell
+dart run bin/searchless_uci.dart
+# uci / isready / position startpos / go movetime 800
+# options: setoption name WeightsFile value models/searchless/params.npz
+#          setoption name Workers value 15
+```
+
+On `isready` it spins up an isolate pool (one net copy per worker) and then scores
+a position's legal moves in parallel — **~800 ms/move** after a one-time ~3.5 s
+load (15 × ~36 MB). `movetime` is accepted but the net is single-pass, so its
+strength does not scale with time. Quick self-check (prints top moves + timing):
+
+```powershell
+dart run bin/searchless_test.dart
+# startpos -> e2e4 53.4%, d2d4 53.0%, g1f3 52.5% ...
+```
+
+### 3. Bigger models (136M / 270M — one-time offline Python)
+
+DeepMind only publishes these in Orbax format, so convert once to npz. This is the
+**only** Python and it runs offline — inference stays pure Dart:
+
+```powershell
+pip install "jax[cpu]" orbax-checkpoint numpy
+# download + unzip https://storage.googleapis.com/searchless_chess/checkpoints/270M.zip
+python scripts/convert_searchless_checkpoint.py --ckpt ./270M --out params_270M.npz
+dart run bin/searchless_uci.dart   # setoption name WeightsFile value params_270M.npz
+```
+
+The loader auto-detects model size (`dim`, layers) from the npz. ⚠️ 270M is ~32×
+the 9M compute (~10–15 s/move in pure Dart) — practical only with a faster matmul
+backend (BLAS/GPU).
+
+### 4. Experimental hybrid
+
+[`bin/searchless_hybrid_uci.dart`](bin/searchless_hybrid_uci.dart) runs the net as
+the strategic chooser with a shallow NNUE alpha-beta as a *blunder veto*. In
+testing this **underperformed the standalone net** (the 9M is stronger than a
+sub-second α-β, so overrides add errors), so it is kept only as a tunable
+experiment (`AbMs`, `MarginCp`, `VetoFloorCp`).
+
+### Files
+
+| File | Role |
+|---|---|
+| [`lib/searchless.dart`](lib/searchless.dart) | npz/npy loader, FEN tokenizer, 1968-move action map, SIMD transformer forward, action-value engine |
+| [`lib/searchless_pool.dart`](lib/searchless_pool.dart) | Isolate pool: parallel per-move scoring, full win-prob map + best move |
+| [`bin/searchless_uci.dart`](bin/searchless_uci.dart) | **UCI engine (standalone net — strongest)** |
+| [`bin/searchless_hybrid_uci.dart`](bin/searchless_hybrid_uci.dart) | Experimental net + alpha-beta blunder-veto hybrid |
+| [`bin/searchless_test.dart`](bin/searchless_test.dart) | Smoke test (prints ranked moves + timing) |
+| [`scripts/convert_searchless_checkpoint.py`](scripts/convert_searchless_checkpoint.py) | One-time offline Orbax → npz converter for 136M / 270M |
 
 ---
 
